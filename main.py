@@ -1,166 +1,213 @@
-import base64
 import os
 import json
+import base64
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import PlainTextResponse
+
+# LINE Bot SDK v3
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from linebot.v3.messaging import (
-    ApiClient,
     Configuration,
+    ApiClient,
     MessagingApi,
     ReplyMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-import gspread
+# Google Sheets
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
+
+# ---------------------------
+# Environment Variables
+# ---------------------------
+CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN", "").strip()
+CHANNEL_SECRET = os.getenv("CHANNEL_SECRET", "").strip()
+
+GOOGLE_SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "").strip()
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Sheet1").strip()  # 你的工作表分頁名稱
+
+
+# ---------------------------
+# App
+# ---------------------------
 app = FastAPI()
 
-# ---- ENV ----
-CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN", "")
-CHANNEL_SECRET = os.getenv("CHANNEL_SECRET", "")
-GSHEET_ID = os.getenv("GSHEET_ID", "")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
+@app.get("/", response_class=PlainTextResponse)
+def health():
+    return "OK"
+
+
+# ---------------------------
+# LINE setup
+# ---------------------------
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
-    # 讓服務仍可啟動，但 webhook 會失敗；方便看 logs
-    print("WARNING: Missing CHANNEL_ACCESS_TOKEN or CHANNEL_SECRET")
+    # 服務仍可啟動，但 webhook 會回 500，log 會提示你缺 env
+    print("[WARN] LINE env missing: CHANNEL_ACCESS_TOKEN or CHANNEL_SECRET")
 
 handler = WebhookHandler(CHANNEL_SECRET)
 
-TZ_TAIPEI = timezone(timedelta(hours=8))
+line_config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+line_api_client = ApiClient(line_config)
+messaging_api = MessagingApi(line_api_client)
 
 
-def _get_gspread_client():
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
-    info = _get_service_account_info()
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds)
+# ---------------------------
+# Google Sheets helper
+# ---------------------------
+def _get_sheets_service():
+    if not GOOGLE_SERVICE_ACCOUNT_B64:
+        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_B64")
+    if not GOOGLE_SHEET_ID:
+        raise RuntimeError("Missing GOOGLE_SHEET_ID")
+
+    sa_json_bytes = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_B64)
+    sa_info = json.loads(sa_json_bytes.decode("utf-8"))
+
+    creds = Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
 def append_order_row(
     *,
     user_id: str,
     display_name: str,
-    text: str,
+    note: str,
+    items_json: Optional[dict] = None,
+    pickup_method: str = "",
+    pickup_date: str = "",
+    pickup_time: str = "",
+    amount: str = "",
+    pay_status: str = "UNPAID",
+    linepay_transaction_id: str = "",
 ):
-    if not GSHEET_ID:
-        raise RuntimeError("Missing GSHEET_ID")
+    """
+    依你 sheet 欄位順序 append：
+    created_at, user_id, display_name, order_id, items_json,
+    pickup_method, pickup_date, pickup_time, note, amount,
+    pay_status, linepay_transaction_id
+    """
+    tz = timezone(timedelta(hours=8))  # GMT+8
+    created_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    order_id = str(uuid.uuid4())[:8]
 
-    gc = _get_gspread_client()
-    sh = gc.open_by_key(GSHEET_ID)
-    ws = sh.sheet1
+    values = [[
+        created_at,
+        user_id,
+        display_name,
+        order_id,
+        json.dumps(items_json or {}, ensure_ascii=False),
+        pickup_method,
+        pickup_date,
+        pickup_time,
+        note,
+        amount,
+        pay_status,
+        linepay_transaction_id,
+    ]]
 
-    created_at = datetime.now(TZ_TAIPEI).isoformat(timespec="seconds")
-    order_id = str(uuid.uuid4())
-
-    # 先用最簡單的 items_json：把使用者輸入存成一個 item
-    items_json = json.dumps(
-        [{"name": "text_message", "qty": 1, "note": text}],
-        ensure_ascii=False,
-    )
-
-    row = [
-        created_at,                 # created_at
-        user_id,                    # user_id
-        display_name,               # display_name
-        order_id,                   # order_id
-        items_json,                 # items_json
-        "",                         # pickup_method
-        "",                         # pickup_date
-        "",                         # pickup_time
-        "",                         # note
-        0,                          # amount
-        "UNPAID",                   # pay_status
-        "",                         # linepay_transaction_id
-    ]
-
-    ws.append_row(row, value_input_option="RAW")
-
-
-def get_display_name(user_id: str) -> str:
-    # 取 profile 可能會因權限/設定失敗，所以做容錯
     try:
-        configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-        with ApiClient(configuration) as api_client:
-            messaging_api = MessagingApi(api_client)
-            profile = messaging_api.get_profile(user_id)
-            return getattr(profile, "display_name", "") or ""
+        service = _get_sheets_service()
+        service.spreadsheets().values().append(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"{GOOGLE_SHEET_NAME}!A:Z",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": values},
+        ).execute()
+        return True
+    except HttpError as e:
+        # Google API 回傳的錯誤會在這裡
+        print("[ERROR] append_order_row HttpError:", str(e))
+        return False
     except Exception as e:
-        print(f"[WARN] get_profile failed: {e}")
-        return ""
+        print("[ERROR] append_order_row failed:", str(e))
+        return False
 
 
-@app.get("/")
-def health():
-    return {"ok": True}
+# ---------------------------
+# LINE message handler
+# ---------------------------
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_text_message(event: MessageEvent):
+    user_id = event.source.user_id if event.source else ""
+    reply_token = event.reply_token
+    text = event.message.text if event.message else ""
+
+    # 取 display name（可能失敗，失敗就用空字串）
+    display_name = ""
+    try:
+        profile = messaging_api.get_profile(user_id)
+        display_name = getattr(profile, "display_name", "") or ""
+    except Exception as e:
+        print("[WARN] get_profile failed:", str(e))
+
+    # 先把訊息寫入 Google Sheet（當作訂單/需求紀錄的第一版）
+    wrote = True
+    if GOOGLE_SERVICE_ACCOUNT_B64 and GOOGLE_SHEET_ID:
+        wrote = append_order_row(
+            user_id=user_id,
+            display_name=display_name,
+            note=text,
+            items_json={"raw_text": text},
+        )
+    else:
+        print("[WARN] Google Sheet env missing, skip append.")
+
+    # 回覆訊息
+    if wrote:
+        reply_text = f"收到：{text}\n（已記錄）"
+    else:
+        reply_text = f"收到：{text}\n（但寫入表單失敗，請稍後再試）"
+
+    try:
+        messaging_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=reply_text)],
+            )
+        )
+    except Exception as e:
+        print("[ERROR] reply_message failed:", str(e))
 
 
-from fastapi import Request
-
+# ---------------------------
+# Webhook endpoint
+# ---------------------------
 @app.post("/callback")
 async def callback(request: Request):
-    body = await request.body()
-    body_text = body.decode("utf-8")
-    print("=== callback hit ===")
-    print("raw body:", body_text)
-    ...
+    if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="LINE env missing")
 
-async def callback(request: Request):
-    signature = request.headers.get("X-Line-Signature", "")
-    body = await request.body()
-    body_text = body.decode("utf-8")
+    signature = request.headers.get("x-line-signature", "")
+    body_bytes = await request.body()
+    body_text = body_bytes.decode("utf-8")
+
+    # Debug：看到 webhook 真的有打進來
+    print("=== callback hit ===")
+    print("signature:", signature[:8] + "..." if signature else "(none)")
+    print("raw body:", body_text[:200] + ("..." if len(body_text) > 200 else ""))
 
     try:
         handler.handle(body_text, signature)
     except InvalidSignatureError:
+        # LINE 會認為你沒有正確驗簽（通常是 Channel Secret 不對）
         raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception as e:
+        print("[ERROR] handler exception:", str(e))
+        raise HTTPException(status_code=500, detail="Handler error")
 
     return "OK"
-
-
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_text_message(event: MessageEvent):
-    user_id = event.source.user_id if event.source else ""
-    text = event.message.text if event.message else ""
-
-    display_name = get_display_name(user_id) if user_id else ""
-
-GOOGLE_SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "")
-
-def _get_service_account_info():
-    if GOOGLE_SERVICE_ACCOUNT_B64:
-        raw = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_B64).decode("utf-8")
-        return json.loads(raw)
-    if GOOGLE_SERVICE_ACCOUNT_JSON:
-        return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_SERVICE_ACCOUNT_B64")
-    
-    # ---- Write to Google Sheet ----
-    try:
-        append_order_row(user_id=user_id, display_name=display_name, text=text)
-        sheet_status = "已寫入訂單表"
-    except Exception as e:
-        print(f"[ERROR] append_order_row failed: {e}")
-        sheet_status = f"寫入失敗：{e}"
-
-    # ---- Reply ----
-    reply_text = f"收到：{text}\n{sheet_status}"
-    configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-
-    with ApiClient(configuration) as api_client:
-        messaging_api = MessagingApi(api_client)
-        messaging_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)],
-            )
-        )
