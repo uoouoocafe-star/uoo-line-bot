@@ -105,6 +105,8 @@ def health():
 
 
 @app.post("/callback")
+    print("=== callback hit ===")
+    print("raw body:", body)
 async def callback(request: Request):
     signature = request.headers.get("X-Line-Signature", "")
     body = await request.body()
