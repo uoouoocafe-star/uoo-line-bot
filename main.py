@@ -104,11 +104,14 @@ def health():
     return {"ok": True}
 
 
+from fastapi import Request
+
 @app.post("/callback")
-def callback():
-    body = request.body()
+async def callback(request: Request):
+    body = await request.body()
+    body_text = body.decode("utf-8")
     print("=== callback hit ===")
-    print("raw body:", body)
+    print("raw body:", body_text)
     ...
 
 async def callback(request: Request):
