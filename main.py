@@ -105,8 +105,7 @@ def health():
 
 
 @app.post("/callback")
-    @app.post("/callback")
-    def callback():
+def callback():
     body = request.body()
     print("=== callback hit ===")
     print("raw body:", body)
