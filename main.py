@@ -1,63 +1,49 @@
 from fastapi import FastAPI, Request, HTTPException
 from linebot.v3 import WebhookHandler
-from linebot.v3.messaging import MessagingApi, Configuration
+from linebot.v3.messaging import (
+    Configuration,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage,
+)
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import os
-from linebot.v3.messaging import ReplyMessageRequest, TextMessage
 
-messaging_api.reply_message(
-    ReplyMessageRequest(
-        reply_token=event.reply_token,
-        messages=[TextMessage(text=reply)],
-    )
-)
-
-# ✅ 一定要有這行（Render 要找的）
+# ========= FastAPI =========
 app = FastAPI()
 
-# LINE 環境變數
+# ========= LINE env =========
 CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
-    raise RuntimeError("Missing LINE channel environment variables")
+    raise RuntimeError("Missing LINE channel env vars")
 
+# ========= LINE SDK =========
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
 messaging_api = MessagingApi(configuration)
+handler = WebhookHandler(CHANNEL_SECRET)
 
-
-# 健康檢查（Render / Browser 用）
+# ========= Health check =========
 @app.get("/")
 def root():
     return {"ok": True}
 
-
-# LINE webhook
+# ========= LINE webhook =========
 @app.post("/callback")
 async def callback(request: Request):
     body = await request.body()
     signature = request.headers.get("X-Line-Signature")
 
-    # ✅ 診斷用：印出是否有 signature、body 前 200 字
-    print("=== LINE CALLBACK HIT ===")
-    print("Has X-Line-Signature:", bool(signature))
-    try:
-        print("Body (first 200 chars):", body.decode("utf-8")[:200])
-    except Exception:
-        print("Body decode failed")
-
     try:
         handler.handle(body.decode("utf-8"), signature)
     except Exception as e:
-        # ✅ 把錯誤印出來（Render logs 才看得到原因）
         print("LINE handler error:", repr(e))
         raise HTTPException(status_code=400, detail=str(e))
 
     return "OK"
 
-
-# 收到文字訊息時的回覆
+# ========= Message handler =========
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     text = event.message.text.strip()
