@@ -1,3 +1,4 @@
+import base64
 import os
 import json
 import uuid
@@ -39,7 +40,7 @@ TZ_TAIPEI = timezone(timedelta(hours=8))
 def _get_gspread_client():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
-    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    info = _get_service_account_info()
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
@@ -124,6 +125,16 @@ def handle_text_message(event: MessageEvent):
 
     display_name = get_display_name(user_id) if user_id else ""
 
+GOOGLE_SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "")
+
+def _get_service_account_info():
+    if GOOGLE_SERVICE_ACCOUNT_B64:
+        raw = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_B64).decode("utf-8")
+        return json.loads(raw)
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_SERVICE_ACCOUNT_B64")
+    
     # ---- Write to Google Sheet ----
     try:
         append_order_row(user_id=user_id, display_name=display_name, text=text)
