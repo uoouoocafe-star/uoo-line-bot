@@ -3,6 +3,14 @@ from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import MessagingApi, Configuration
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import os
+from linebot.v3.messaging import ReplyMessageRequest, TextMessage
+
+messaging_api.reply_message(
+    ReplyMessageRequest(
+        reply_token=event.reply_token,
+        messages=[TextMessage(text=reply)],
+    )
+)
 
 # ✅ 一定要有這行（Render 要找的）
 app = FastAPI()
@@ -60,6 +68,8 @@ def handle_message(event):
         reply = f"你說的是：{text}"
 
     messaging_api.reply_message(
-        reply_token=event.reply_token,
-        messages=[{"type": "text", "text": reply}],
+        ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[TextMessage(text=reply)],
+        )
     )
