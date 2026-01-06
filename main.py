@@ -31,9 +31,19 @@ async def callback(request: Request):
     body = await request.body()
     signature = request.headers.get("X-Line-Signature")
 
+    # ✅ 診斷用：印出是否有 signature、body 前 200 字
+    print("=== LINE CALLBACK HIT ===")
+    print("Has X-Line-Signature:", bool(signature))
+    try:
+        print("Body (first 200 chars):", body.decode("utf-8")[:200])
+    except Exception:
+        print("Body decode failed")
+
     try:
         handler.handle(body.decode("utf-8"), signature)
     except Exception as e:
+        # ✅ 把錯誤印出來（Render logs 才看得到原因）
+        print("LINE handler error:", repr(e))
         raise HTTPException(status_code=400, detail=str(e))
 
     return "OK"
