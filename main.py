@@ -43,7 +43,7 @@ GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
-SHEET_NAME = os.getenv("SHEET_NAME", "sheet1").strip()
+SHEET_NAME = os.getenv("SHEET_NAME", "").strip()
 
 TZ = timezone(timedelta(hours=8))  # Asia/Taipei
 
