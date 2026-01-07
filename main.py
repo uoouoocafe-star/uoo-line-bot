@@ -388,7 +388,14 @@ def bubble(title: str, body_contents: List[dict], size: str = "mega") -> dict:
 
 
 def flex_message(alt: str, contents: dict) -> dict:
+    # LINE 要求：altText 不可空、contents 不可空
+    # 若 builder 回傳 None / {}，就不要送 flex，改送 text
+    if not alt or not str(alt).strip():
+        alt = "訊息"
+    if not contents or not isinstance(contents, dict) or not contents.get("type"):
+        return {"type": "text", "text": "系統忙碌中，請再按一次或輸入：我要下單 / 甜點"}
     return {"type": "flex", "altText": alt, "contents": contents}
+
 
 
 def build_sweets_info_flex() -> dict:
