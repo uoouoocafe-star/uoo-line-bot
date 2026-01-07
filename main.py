@@ -1,3 +1,4 @@
+# main.py
 import os
 import json
 import base64
@@ -21,6 +22,9 @@ from linebot.v3.messaging import (
     PushMessageRequest,
     TextMessage,
     FlexMessage,
+    QuickReply,
+    QuickReplyItem,
+    MessageAction,
 )
 
 from google.oauth2 import service_account
@@ -58,8 +62,7 @@ messaging_api = MessagingApi(api_client)
 
 
 # =========================
-# In-memory session store (簡單版)
-# 你部署在 Render free 可能會重啟，購物車就會清掉（可接受先跑起來）
+# In-memory session store
 # =========================
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
@@ -67,15 +70,15 @@ SESSIONS: Dict[str, Dict[str, Any]] = {}
 def get_session(user_id: str) -> Dict[str, Any]:
     if user_id not in SESSIONS:
         SESSIONS[user_id] = {
-            "cart": [],  # list of items
+            "cart": [],
             "state": "IDLE",
             "pending_item": None,
             "pending_flavor": None,
-            "pickup_method": None,  # 店取 / 宅配
+            "pickup_method": None,   # 店取 / 宅配
             "pickup_date": None,
             "pickup_time": None,
-            "pickup_name": None,
-            "delivery_date": None,  # 希望到貨日期
+            "pickup_name": None,     # 店取取件人姓名
+            "delivery_date": None,   # 希望到貨日期
             "delivery_name": None,
             "delivery_phone": None,
             "delivery_address": None,
@@ -220,66 +223,85 @@ def date_in_range_3_to_14_days(dt: datetime) -> bool:
     return min_d <= target <= max_d
 
 
-def reply_text(reply_token: str, text: str):
-    messaging_api.reply_message(
-        ReplyMessageRequest(
-            replyToken=reply_token,
-            messages=[TextMessage(text=text)],
+# ---------- LINE send helpers (修正版：reply_token 只用一次) ----------
+def reply_messages(reply_token: str, messages):
+    if not isinstance(messages, list):
+        messages = [messages]
+    if not messages:
+        messages = [TextMessage(text="⚠️ 系統忙碌中，請再試一次")]
+
+    try:
+        messaging_api.reply_message(
+            ReplyMessageRequest(
+                replyToken=reply_token,
+                messages=messages,
+            )
         )
-    )
+    except Exception as e:
+        print("[ERROR] reply_messages failed:", repr(e))
+        raise
+
+
+def reply_text(reply_token: str, text: str):
+    reply_messages(reply_token, TextMessage(text=text))
 
 
 def push_text(user_id: str, text: str):
-    messaging_api.push_message(
-        PushMessageRequest(
-            to=user_id,
-            messages=[TextMessage(text=text)],
+    try:
+        messaging_api.push_message(
+            PushMessageRequest(
+                to=user_id,
+                messages=[TextMessage(text=text)],
+            )
         )
-    )
+    except Exception as e:
+        print("[ERROR] push_text failed:", repr(e))
+        raise
 
 
 def reply_flex_json(reply_token: str, alt_text: str, flex_content: dict):
-    messaging_api.reply_message(
-        ReplyMessageRequest(
-            replyToken=reply_token,
-            messages=[
-                FlexMessage(
-                    altText=alt_text,
-                    contents=flex_content,
-                )
-            ],
+    if not isinstance(flex_content, dict) or "type" not in flex_content:
+        reply_text(reply_token, "⚠️ 卡片內容異常，請輸入「甜點」重試。")
+        return
+
+    reply_messages(
+        reply_token,
+        FlexMessage(
+            altText=alt_text,
+            contents=flex_content,
         )
     )
 
 
 def push_quick_reply(user_id: str, text: str, items: List[dict]):
     # items: [{"label": "...", "text": "..."}]
-    qr = {
-        "type": "text",
-        "text": text,
-        "quickReply": {
-            "items": [
-                {
-                    "type": "action",
-                    "action": {"type": "message", "label": it["label"], "text": it["text"]},
-                }
-                for it in items
-            ]
-        },
-    }
-    messaging_api.push_message(
-        PushMessageRequest(
-            to=user_id,
-            messages=[qr],
+    try:
+        qr_items = [
+            QuickReplyItem(
+                action=MessageAction(label=it["label"], text=it["text"])
+            )
+            for it in items
+        ]
+        messaging_api.push_message(
+            PushMessageRequest(
+                to=user_id,
+                messages=[
+                    TextMessage(
+                        text=text,
+                        quickReply=QuickReply(items=qr_items),
+                    )
+                ],
+            )
         )
-    )
+    except Exception as e:
+        print("[ERROR] push_quick_reply failed:", repr(e))
+        raise
 
 
 # =========================
 # Flex builders
 # =========================
 def build_product_menu_flex() -> dict:
-    # 4 buttons + checkout / clear
     def btn(label: str, text: str) -> dict:
         return {
             "type": "button",
@@ -301,20 +323,9 @@ def build_product_menu_flex() -> dict:
                 btn("原味司康｜NT$65", "ITEM:scone"),
                 btn("原味可麗露｜NT$90", "ITEM:canele"),
                 btn("伊思尼奶酥厚片｜NT$85", "ITEM:toast"),
-                {
-                    "type": "separator",
-                    "margin": "lg",
-                },
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "action": {"type": "message", "label": "🧾 前往結帳", "text": "前往結帳"},
-                },
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "action": {"type": "message", "label": "🗑 清空重來", "text": "清空重來"},
-                },
+                {"type": "separator", "margin": "lg"},
+                {"type": "button", "style": "secondary", "action": {"type": "message", "label": "🧾 前往結帳", "text": "前往結帳"}},
+                {"type": "button", "style": "secondary", "action": {"type": "message", "label": "🗑 清空重來", "text": "清空重來"}},
             ],
         },
     }
@@ -329,22 +340,9 @@ def build_pickup_method_flex() -> dict:
             "spacing": "md",
             "contents": [
                 {"type": "text", "text": "取貨方式", "weight": "bold", "size": "xl"},
-                {
-                    "type": "text",
-                    "text": "請選擇店取或宅配",
-                    "size": "sm",
-                    "color": "#666666",
-                },
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "action": {"type": "message", "label": "🏪 店取", "text": "取貨:店取"},
-                },
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "action": {"type": "message", "label": "🚚 冷凍宅配", "text": "取貨:宅配"},
-                },
+                {"type": "text", "text": "請選擇店取或宅配", "size": "sm", "color": "#666666"},
+                {"type": "button", "style": "primary", "action": {"type": "message", "label": "🏪 店取", "text": "取貨:店取"}},
+                {"type": "button", "style": "primary", "action": {"type": "message", "label": "🚚 冷凍宅配", "text": "取貨:宅配"}},
             ],
         },
     }
@@ -374,7 +372,6 @@ def ask_flavor(user_id: str, item_key: str):
 
 def ask_qty(user_id: str, item_key: str):
     min_qty = ITEMS[item_key]["min_qty"]
-    # 做 2~12 或 1~12
     start = min_qty
     end = 12
     items = [{"label": str(i), "text": f"QTY:{i}"} for i in range(start, end + 1)]
@@ -393,7 +390,6 @@ def add_to_cart(user_id: str, item_key: str, flavor: Optional[str], qty: int):
     if qty < meta["min_qty"]:
         raise ValueError(f"qty must be >= {meta['min_qty']}")
 
-    # 達克瓦茲「口味不可混」：這裡做法是每一筆都綁定一個 flavor，自然不會混
     subtotal = unit * qty
     sess["cart"].append(
         {
@@ -419,7 +415,6 @@ def cart_summary_text(cart: List[dict]) -> str:
 
 
 def after_added_actions(user_id: str):
-    # 加購 or 結帳 quick reply
     push_quick_reply(
         user_id,
         "請選擇下一步 👇",
@@ -444,35 +439,32 @@ def create_order_and_write_sheet(user_id: str, display_name: str) -> str:
     pickup_time = sess.get("pickup_time", "")
     note = sess.get("note", "")
 
-    # 宅配：把地址/電話/姓名一起塞在 note 裡（簡單好查）
     if pickup_method == "宅配":
         delivery_date = sess.get("delivery_date", "")
         dn = sess.get("delivery_name", "")
         dp = sess.get("delivery_phone", "")
         da = sess.get("delivery_address", "")
         note = (note + " | " if note else "") + f"希望到貨:{delivery_date} | 收件人:{dn} | 電話:{dp} | 地址:{da}"
-        # pickup_date 欄位改存希望到貨日期，方便你在表格看
         pickup_date = delivery_date
         pickup_time = ""
 
-    # 店取：把取件人姓名寫入 note（你希望店取要收取件人姓名）
     if pickup_method == "店取":
         pn = sess.get("pickup_name", "")
         note = (note + " | " if note else "") + f"取件人:{pn}"
 
     row = [
-        now_str(),          # created_at
-        user_id,            # user_id
-        display_name,       # display_name
-        order_id,           # order_id
-        json.dumps({"cart": cart}, ensure_ascii=False),  # items_json
-        pickup_method,      # pickup_method
-        pickup_date,        # pickup_date (宅配＝希望到貨日期)
-        pickup_time,        # pickup_time
-        note,               # note
-        total,              # amount
-        "UNPAID",           # pay_status
-        "",                 # linepay_transaction_id (先留空)
+        now_str(),
+        user_id,
+        display_name,
+        order_id,
+        json.dumps({"cart": cart}, ensure_ascii=False),
+        pickup_method,
+        pickup_date,
+        pickup_time,
+        note,
+        total,
+        "UNPAID",
+        "",
     ]
 
     ok = append_order_row(row)
@@ -513,10 +505,9 @@ async def callback(request: Request):
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
     user_id = event.source.user_id
-    text = event.message.text.strip()
+    text = (event.message.text or "").strip()
     sess = get_session(user_id)
 
-    # 取 display name（可先不用抓 profile，避免多 API）
     display_name = "LINE用戶"
 
     # ---------- global commands ----------
@@ -554,8 +545,15 @@ def handle_message(event: MessageEvent):
         if not sess["cart"]:
             reply_text(event.reply_token, "你的購物車是空的，先輸入「甜點」選商品。")
             return
-        reply_text(event.reply_token, "好，接著選取貨方式。")
-        reply_flex_json(event.reply_token, "取貨方式", build_pickup_method_flex())
+
+        # 修正點：reply_token 只能用一次 → 一次回兩則（文字 + flex）
+        reply_messages(
+            event.reply_token,
+            [
+                TextMessage(text="好，接著選取貨方式。"),
+                FlexMessage(altText="取貨方式", contents=build_pickup_method_flex()),
+            ]
+        )
         sess["state"] = "WAIT_PICKUP_METHOD"
         return
 
@@ -565,6 +563,7 @@ def handle_message(event: MessageEvent):
         if item_key not in ITEMS:
             reply_text(event.reply_token, "品項不存在，請重新輸入「甜點」。")
             return
+
         sess["pending_item"] = item_key
         sess["pending_flavor"] = None
 
@@ -582,6 +581,7 @@ def handle_message(event: MessageEvent):
     if text.startswith("FLAVOR:"):
         flavor = text.split(":", 1)[1].strip()
         item_key = sess.get("pending_item")
+
         if not item_key or item_key not in ITEMS:
             reply_text(event.reply_token, "流程有點亂掉了，請輸入「甜點」重新開始。")
             return
@@ -619,12 +619,10 @@ def handle_message(event: MessageEvent):
             reply_text(event.reply_token, f"加入失敗：{e}\n請重新選擇。輸入「甜點」開始。")
             return
 
-        # 清 pending
         sess["pending_item"] = None
         sess["pending_flavor"] = None
         sess["state"] = "IDLE"
 
-        # 回覆加入購物車 + 小計
         meta = ITEMS[item_key]
         name = meta["label"] + (f"（{flavor}）" if flavor else "")
         subtotal = meta["unit_price"] * qty
@@ -637,7 +635,6 @@ def handle_message(event: MessageEvent):
             f"目前小計：{total}"
         )
 
-        # 重要：加購 / 結帳選擇（用 push，避免跟 reply token 混亂）
         after_added_actions(user_id)
         return
 
@@ -645,7 +642,6 @@ def handle_message(event: MessageEvent):
     if text.startswith("取貨:"):
         method = text.split(":", 1)[1].strip()
         if method not in ["店取", "宅配"]:
-            reply_text(event.reply_token, "取貨方式不正確，請重新選擇。")
             reply_flex_json(event.reply_token, "取貨方式", build_pickup_method_flex())
             return
 
@@ -712,10 +708,8 @@ def handle_message(event: MessageEvent):
     # ---------- pickup name ----------
     if sess["state"] == "WAIT_PICKUP_NAME":
         sess["pickup_name"] = text
-        sess["state"] = "CONFIRM"
-        order_id = create_order_and_write_sheet(user_id, display_name)
 
-        total = cart_total(sess["cart"])
+        order_id = create_order_and_write_sheet(user_id, display_name)
         summary = cart_summary_text(sess["cart"])
 
         reply_text(
@@ -727,7 +721,7 @@ def handle_message(event: MessageEvent):
             f"店取地址：{PICKUP_ADDRESS}\n\n"
             + BANK_TRANSFER_TEXT
         )
-        # 訂單完成後清空購物車（避免重複）
+
         sess["cart"] = []
         sess["state"] = "IDLE"
         return
@@ -747,13 +741,11 @@ def handle_message(event: MessageEvent):
 
     if sess["state"] == "WAIT_DELIVERY_ADDRESS":
         sess["delivery_address"] = text
-        sess["state"] = "CONFIRM"
-        order_id = create_order_and_write_sheet(user_id, display_name)
 
+        order_id = create_order_and_write_sheet(user_id, display_name)
         total = cart_total(sess["cart"])
         fee = shipping_fee(total)
         grand = total + fee
-
         summary = cart_summary_text(sess["cart"])
 
         reply_text(
@@ -768,11 +760,12 @@ def handle_message(event: MessageEvent):
             + "\n\n"
             + BANK_TRANSFER_TEXT
         )
+
         sess["cart"] = []
         sess["state"] = "IDLE"
         return
 
-    # ---------- payment confirm message (optional) ----------
+    # ---------- payment confirm message ----------
     if text.startswith("已轉帳"):
         reply_text(
             event.reply_token,
