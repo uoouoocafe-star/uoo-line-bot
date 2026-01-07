@@ -1,3 +1,10 @@
+# main.py — 整合版（甜點=只看菜單 / 我要下單=開始下單 / 全部按鈕不顯示程式碼）
+# 重點：
+# 1) 所有按鈕一律用 postback（聊天室不會出現 ITEM: / FLAVOR: / QTY:）
+# 2) 「甜點」只顯示菜單預覽（不能點品項），「我要下單」才開啟可點選的下單選單
+# 3) Flex dict 一律轉 FlexContainer，避免 LINE 400：At least one block must be specified
+# 4) reply_token 只用一次（一次回覆多則訊息）
+
 import os
 import json
 import base64
@@ -11,7 +18,7 @@ from fastapi.responses import PlainTextResponse
 
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent
 
 from linebot.v3.messaging import (
     ApiClient,
@@ -24,9 +31,9 @@ from linebot.v3.messaging import (
     QuickReply,
     QuickReplyItem,
     MessageAction,
+    PostbackAction,
 )
 
-# ★關鍵：Flex dict 需要轉成 FlexContainer，避免 contents 被送成空而 400
 from linebot.v3.messaging.models import FlexContainer
 
 from google.oauth2 import service_account
@@ -87,6 +94,10 @@ def get_session(user_id: str) -> Dict[str, Any]:
             "note": "",
         }
     return SESSIONS[user_id]
+
+
+def reset_session(user_id: str):
+    SESSIONS.pop(user_id, None)
 
 
 # =========================
@@ -226,25 +237,20 @@ def date_in_range_3_to_14_days(dt: datetime) -> bool:
 
 
 # =========================
-# LINE send helpers (保命版)
+# LINE send helpers
 # =========================
 def reply_messages(reply_token: str, messages):
-    """reply_token 只能用一次：一次回覆多則訊息"""
     if not isinstance(messages, list):
         messages = [messages]
     if not messages:
         messages = [TextMessage(text="⚠️ 系統忙碌中，請再試一次")]
 
-    try:
-        messaging_api.reply_message(
-            ReplyMessageRequest(
-                replyToken=reply_token,
-                messages=messages,
-            )
+    messaging_api.reply_message(
+        ReplyMessageRequest(
+            replyToken=reply_token,
+            messages=messages,
         )
-    except Exception as e:
-        print("[ERROR] reply_messages failed:", repr(e))
-        raise
+    )
 
 
 def reply_text(reply_token: str, text: str):
@@ -252,20 +258,15 @@ def reply_text(reply_token: str, text: str):
 
 
 def push_text(user_id: str, text: str):
-    try:
-        messaging_api.push_message(
-            PushMessageRequest(
-                to=user_id,
-                messages=[TextMessage(text=text)],
-            )
+    messaging_api.push_message(
+        PushMessageRequest(
+            to=user_id,
+            messages=[TextMessage(text=text)],
         )
-    except Exception as e:
-        print("[ERROR] push_text failed:", repr(e))
-        raise
+    )
 
 
 def flex_container_from_dict(flex_dict: dict) -> Optional[FlexContainer]:
-    """把 dict 轉成 FlexContainer，避免 contents 送成空而 400"""
     try:
         if not isinstance(flex_dict, dict) or "type" not in flex_dict:
             return None
@@ -278,78 +279,70 @@ def flex_container_from_dict(flex_dict: dict) -> Optional[FlexContainer]:
 def reply_flex_dict(reply_token: str, alt_text: str, flex_dict: dict):
     container = flex_container_from_dict(flex_dict)
     if not container:
-        reply_text(reply_token, "⚠️ 卡片內容異常，請輸入「甜點」重試。")
+        reply_text(reply_token, "⚠️ 卡片內容異常，請輸入「甜點」或「我要下單」重試。")
         return
-
-    try:
-        reply_messages(
-            reply_token,
-            FlexMessage(
-                alt_text=alt_text,   # ★注意：v3 用 alt_text
-                contents=container,
-            )
-        )
-    except Exception as e:
-        print("[ERROR] reply_flex_dict failed:", repr(e))
-        reply_text(reply_token, "⚠️ 卡片送出失敗，請輸入「甜點」再試一次。")
+    reply_messages(reply_token, FlexMessage(alt_text=alt_text, contents=container))
 
 
 def push_flex_dict(user_id: str, alt_text: str, flex_dict: dict):
     container = flex_container_from_dict(flex_dict)
     if not container:
-        push_text(user_id, "⚠️ 卡片內容異常，請輸入「甜點」重試。")
+        push_text(user_id, "⚠️ 卡片內容異常，請輸入「甜點」或「我要下單」重試。")
         return
-
-    try:
-        messaging_api.push_message(
-            PushMessageRequest(
-                to=user_id,
-                messages=[
-                    FlexMessage(
-                        alt_text=alt_text,
-                        contents=container,
-                    )
-                ],
-            )
+    messaging_api.push_message(
+        PushMessageRequest(
+            to=user_id,
+            messages=[FlexMessage(alt_text=alt_text, contents=container)],
         )
-    except Exception as e:
-        print("[ERROR] push_flex_dict failed:", repr(e))
-        push_text(user_id, "⚠️ 卡片送出失敗，請輸入「甜點」再試一次。")
+    )
 
 
-def push_quick_reply(user_id: str, text: str, items: List[dict]):
-    """items: [{"label": "...", "text": "..."}] — 用 SDK model，避免 dict 被擋"""
-    try:
-        qr_items = [
-            QuickReplyItem(action=MessageAction(label=it["label"], text=it["text"]))
-            for it in items
-        ]
-        messaging_api.push_message(
-            PushMessageRequest(
-                to=user_id,
-                messages=[
-                    TextMessage(
-                        text=text,
-                        quickReply=QuickReply(items=qr_items),
-                    )
-                ],
-            )
+def push_quick_reply_postback(user_id: str, text: str, items: List[dict]):
+    # items: [{"label": "...", "data": "..."}]
+    qr_items = [QuickReplyItem(action=PostbackAction(label=it["label"], data=it["data"])) for it in items]
+    messaging_api.push_message(
+        PushMessageRequest(
+            to=user_id,
+            messages=[TextMessage(text=text, quickReply=QuickReply(items=qr_items))],
         )
-    except Exception as e:
-        print("[ERROR] push_quick_reply failed:", repr(e))
-        raise
+    )
 
 
 # =========================
 # Flex builders
 # =========================
-def build_product_menu_flex() -> dict:
-    def btn(label: str, text: str) -> dict:
-        return {
-            "type": "button",
-            "style": "primary",
-            "action": {"type": "message", "label": label, "text": text},
-        }
+def build_menu_preview_flex() -> dict:
+    lines = [
+        "達克瓦茲 NT$95（2入起）",
+        "原味司康 NT$65",
+        "原味可麗露 NT$90",
+        "伊思尼奶酥厚片 NT$85",
+    ]
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": "甜點菜單", "weight": "bold", "size": "xl"},
+                {"type": "text", "text": "（全部甜點需提前 3 天預訂）", "size": "sm", "color": "#666666"},
+                {"type": "text", "text": "\n".join([f"• {x}" for x in lines]), "wrap": True, "size": "md"},
+                {"type": "separator", "margin": "lg"},
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "action": {"type": "postback", "label": "我要下單", "data": "CMD:START_ORDER"},
+                },
+            ],
+        },
+    }
+
+
+def build_order_menu_flex() -> dict:
+    def btn(label: str, data: str) -> dict:
+        return {"type": "button", "style": "primary", "action": {"type": "postback", "label": label, "data": data}}
 
     return {
         "type": "bubble",
@@ -366,8 +359,8 @@ def build_product_menu_flex() -> dict:
                 btn("原味可麗露｜NT$90", "ITEM:canele"),
                 btn("伊思尼奶酥厚片｜NT$85", "ITEM:toast"),
                 {"type": "separator", "margin": "lg"},
-                {"type": "button", "style": "secondary", "action": {"type": "message", "label": "🧾 前往結帳", "text": "前往結帳"}},
-                {"type": "button", "style": "secondary", "action": {"type": "message", "label": "🗑 清空重來", "text": "清空重來"}},
+                {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "🧾 前往結帳", "data": "CMD:CHECKOUT"}},
+                {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "🗑 清空重來", "data": "CMD:RESET"}},
             ],
         },
     }
@@ -383,8 +376,8 @@ def build_pickup_method_flex() -> dict:
             "contents": [
                 {"type": "text", "text": "取貨方式", "weight": "bold", "size": "xl"},
                 {"type": "text", "text": "請選擇店取或宅配", "size": "sm", "color": "#666666"},
-                {"type": "button", "style": "primary", "action": {"type": "message", "label": "🏪 店取", "text": "取貨:店取"}},
-                {"type": "button", "style": "primary", "action": {"type": "message", "label": "🚚 冷凍宅配", "text": "取貨:宅配"}},
+                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🏪 店取", "data": "取貨:店取"}},
+                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🚚 冷凍宅配", "data": "取貨:宅配"}},
             ],
         },
     }
@@ -393,24 +386,32 @@ def build_pickup_method_flex() -> dict:
 # =========================
 # Business logic
 # =========================
-def show_product_menu(user_id: str, reply_token: Optional[str] = None):
-    flex = build_product_menu_flex()
+def show_menu_preview(user_id: str, reply_token: Optional[str] = None):
+    flex = build_menu_preview_flex()
     if reply_token:
-        reply_flex_dict(reply_token, "甜點選單", flex)
+        reply_flex_dict(reply_token, "甜點菜單", flex)
     else:
-        push_flex_dict(user_id, "甜點選單", flex)
+        push_flex_dict(user_id, "甜點菜單", flex)
+
+
+def show_order_menu(user_id: str, reply_token: Optional[str] = None):
+    flex = build_order_menu_flex()
+    if reply_token:
+        reply_flex_dict(reply_token, "開始下單", flex)
+    else:
+        push_flex_dict(user_id, "開始下單", flex)
 
 
 def ask_flavor(user_id: str, item_key: str):
     flavors = ITEMS[item_key]["flavors"]
-    items = [{"label": f, "text": f"FLAVOR:{f}"} for f in flavors]
-    push_quick_reply(user_id, "你選了，請選口味：", items)
+    items = [{"label": f, "data": f"FLAVOR:{f}"} for f in flavors]
+    push_quick_reply_postback(user_id, "你選了，請選口味：", items)
 
 
 def ask_qty(user_id: str, item_key: str):
     min_qty = ITEMS[item_key]["min_qty"]
-    items = [{"label": str(i), "text": f"QTY:{i}"} for i in range(min_qty, 13)]
-    push_quick_reply(user_id, f"請選數量（最少 {min_qty}）：", items)
+    items = [{"label": str(i), "data": f"QTY:{i}"} for i in range(min_qty, 13)]
+    push_quick_reply_postback(user_id, f"請選數量（最少 {min_qty}）：", items)
 
 
 def add_to_cart(user_id: str, item_key: str, flavor: Optional[str], qty: int):
@@ -424,6 +425,7 @@ def add_to_cart(user_id: str, item_key: str, flavor: Optional[str], qty: int):
 
     unit = meta["unit_price"]
     subtotal = unit * qty
+
     sess["cart"].append(
         {
             "item_key": item_key,
@@ -448,12 +450,12 @@ def cart_summary_text(cart: List[dict]) -> str:
 
 
 def after_added_actions(user_id: str):
-    push_quick_reply(
+    push_quick_reply_postback(
         user_id,
         "請選擇下一步 👇",
         [
-            {"label": "➕ 繼續加購", "text": "甜點"},
-            {"label": "🧾 前往結帳", "text": "前往結帳"},
+            {"label": "➕ 繼續加購", "data": "CMD:START_ORDER"},
+            {"label": "🧾 前往結帳", "data": "CMD:CHECKOUT"},
         ],
     )
 
@@ -533,7 +535,7 @@ async def callback(request: Request):
 
 
 # =========================
-# LINE Webhook Handlers
+# LINE Handlers — Text
 # =========================
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
@@ -543,167 +545,32 @@ def handle_message(event: MessageEvent):
 
     display_name = "LINE用戶"
 
-    # ---------- global commands ----------
+    # 清空
     if text in ["清空重來", "清空", "reset"]:
-        sess["cart"] = []
-        sess["state"] = "IDLE"
-        sess["pending_item"] = None
-        sess["pending_flavor"] = None
-        sess["pickup_method"] = None
-        sess["pickup_date"] = None
-        sess["pickup_time"] = None
-        sess["pickup_name"] = None
-        sess["delivery_date"] = None
-        sess["delivery_name"] = None
-        sess["delivery_phone"] = None
-        sess["delivery_address"] = None
-        sess["note"] = ""
-        reply_text(event.reply_token, "已清空，重新開始。輸入「甜點」開啟選單。")
+        reset_session(user_id)
+        reply_text(event.reply_token, "已清空。輸入「甜點」看菜單，或輸入「我要下單」開始。")
         return
 
-    if text in ["甜點", "我要下單", "選單", "下訂單"]:
-        show_product_menu(user_id, reply_token=event.reply_token)
+    # 甜點：只看菜單（不能點品項）
+    if text == "甜點":
+        show_menu_preview(user_id, reply_token=event.reply_token)
         return
 
-    if text in ["取貨說明"]:
+    # 我要下單：開始下單（可點品項）
+    if text in ["我要下單", "下訂單", "開始下單"]:
+        sess["state"] = "ORDERING"
+        show_order_menu(user_id, reply_token=event.reply_token)
+        return
+
+    if text == "取貨說明":
         reply_text(event.reply_token, PICKUP_NOTICE + "\n\n" + DELIVERY_NOTICE)
         return
 
-    if text in ["付款說明"]:
+    if text == "付款說明":
         reply_text(event.reply_token, BANK_TRANSFER_TEXT)
         return
 
-    # ---------- checkout entry ----------
-    if text == "前往結帳":
-        if not sess["cart"]:
-            reply_text(event.reply_token, "你的購物車是空的，先輸入「甜點」選商品。")
-            return
-
-        # 一次 reply 多則（避免 reply_token 用兩次）
-        pickup_flex = flex_container_from_dict(build_pickup_method_flex())
-        if not pickup_flex:
-            reply_text(event.reply_token, "⚠️ 取貨卡片內容異常，請輸入「甜點」重試。")
-            return
-
-        reply_messages(
-            event.reply_token,
-            [
-                TextMessage(text="好，接著選取貨方式。"),
-                FlexMessage(alt_text="取貨方式", contents=pickup_flex),
-            ]
-        )
-        sess["state"] = "WAIT_PICKUP_METHOD"
-        return
-
-    # ---------- item selection ----------
-    if text.startswith("ITEM:"):
-        item_key = text.split(":", 1)[1].strip()
-        if item_key not in ITEMS:
-            reply_text(event.reply_token, "品項不存在，請重新輸入「甜點」。")
-            return
-
-        sess["pending_item"] = item_key
-        sess["pending_flavor"] = None
-
-        if ITEMS[item_key]["has_flavor"]:
-            reply_text(event.reply_token, f"你選了：{ITEMS[item_key]['label']}，請選口味。")
-            ask_flavor(user_id, item_key)
-            sess["state"] = "WAIT_FLAVOR"
-        else:
-            reply_text(event.reply_token, f"你選了：{ITEMS[item_key]['label']}，請選數量。")
-            ask_qty(user_id, item_key)
-            sess["state"] = "WAIT_QTY"
-        return
-
-    # ---------- flavor ----------
-    if text.startswith("FLAVOR:"):
-        flavor = text.split(":", 1)[1].strip()
-        item_key = sess.get("pending_item")
-
-        if not item_key or item_key not in ITEMS:
-            reply_text(event.reply_token, "流程有點亂掉了，請輸入「甜點」重新開始。")
-            return
-
-        if flavor not in ITEMS[item_key]["flavors"]:
-            reply_text(event.reply_token, "口味不正確，請重新選口味。")
-            ask_flavor(user_id, item_key)
-            return
-
-        sess["pending_flavor"] = flavor
-        reply_text(event.reply_token, f"口味：{flavor}\n請選數量。")
-        ask_qty(user_id, item_key)
-        sess["state"] = "WAIT_QTY"
-        return
-
-    # ---------- qty ----------
-    if text.startswith("QTY:"):
-        qty_raw = text.split(":", 1)[1].strip()
-        try:
-            qty = int(qty_raw)
-        except Exception:
-            reply_text(event.reply_token, "數量格式錯誤，請重新選數量。")
-            return
-
-        item_key = sess.get("pending_item")
-        if not item_key or item_key not in ITEMS:
-            reply_text(event.reply_token, "流程有點亂掉了，請輸入「甜點」重新開始。")
-            return
-
-        flavor = sess.get("pending_flavor")
-
-        try:
-            add_to_cart(user_id, item_key, flavor, qty)
-        except Exception as e:
-            reply_text(event.reply_token, f"加入失敗：{e}\n請重新選擇。輸入「甜點」開始。")
-            return
-
-        sess["pending_item"] = None
-        sess["pending_flavor"] = None
-        sess["state"] = "IDLE"
-
-        meta = ITEMS[item_key]
-        name = meta["label"] + (f"（{flavor}）" if flavor else "")
-        subtotal = meta["unit_price"] * qty
-        total = cart_total(sess["cart"])
-
-        reply_text(
-            event.reply_token,
-            "✅ 已加入購物車\n"
-            f"- {name} x{qty} = {subtotal}\n\n"
-            f"目前小計：{total}"
-        )
-
-        after_added_actions(user_id)
-        return
-
-    # ---------- pickup method ----------
-    if text.startswith("取貨:"):
-        method = text.split(":", 1)[1].strip()
-        if method not in ["店取", "宅配"]:
-            reply_flex_dict(event.reply_token, "取貨方式", build_pickup_method_flex())
-            return
-
-        sess["pickup_method"] = method
-
-        if method == "店取":
-            sess["state"] = "WAIT_PICKUP_DATE"
-            reply_text(
-                event.reply_token,
-                "店取：請輸入希望取貨日期（YYYY-MM-DD）\n"
-                "只能選 3～14 天內（甜點需提前 3 天預訂）。"
-            )
-            return
-
-        if method == "宅配":
-            sess["state"] = "WAIT_DELIVERY_DATE"
-            reply_text(
-                event.reply_token,
-                "宅配：請輸入「希望到貨日期」（YYYY-MM-DD）\n"
-                "只能選 3～14 天內（不保證準時到貨，僅作為希望日）。"
-            )
-            return
-
-    # ---------- date input ----------
+    # 日期輸入（店取/宅配）
     if sess["state"] in ["WAIT_PICKUP_DATE", "WAIT_DELIVERY_DATE"]:
         dt = parse_date_yyyy_mm_dd(text)
         if not dt:
@@ -717,16 +584,16 @@ def handle_message(event: MessageEvent):
         if sess["state"] == "WAIT_PICKUP_DATE":
             sess["pickup_date"] = dt.strftime("%Y-%m-%d")
             sess["state"] = "WAIT_PICKUP_TIME"
-            push_quick_reply(
+            push_quick_reply_postback(
                 user_id,
                 "請選店取時段：",
                 [
-                    {"label": "10:00-12:00", "text": "時段:10:00-12:00"},
-                    {"label": "12:00-14:00", "text": "時段:12:00-14:00"},
-                    {"label": "14:00-16:00", "text": "時段:14:00-16:00"},
+                    {"label": "10:00-12:00", "data": "時段:10:00-12:00"},
+                    {"label": "12:00-14:00", "data": "時段:12:00-14:00"},
+                    {"label": "14:00-16:00", "data": "時段:14:00-16:00"},
                 ],
             )
-            reply_text(event.reply_token, "已收到取貨日期，請選時段（上方按鈕）。")
+            reply_text(event.reply_token, "已收到取貨日期，請選時段（下方按鈕）。")
             return
 
         if sess["state"] == "WAIT_DELIVERY_DATE":
@@ -735,15 +602,7 @@ def handle_message(event: MessageEvent):
             reply_text(event.reply_token, "請輸入宅配收件人姓名：")
             return
 
-    # ---------- pickup time ----------
-    if text.startswith("時段:") and sess["state"] == "WAIT_PICKUP_TIME":
-        t = text.split(":", 1)[1].strip()
-        sess["pickup_time"] = t
-        sess["state"] = "WAIT_PICKUP_NAME"
-        reply_text(event.reply_token, "請輸入店取取件人姓名：")
-        return
-
-    # ---------- pickup name ----------
+    # 店取取件人姓名
     if sess["state"] == "WAIT_PICKUP_NAME":
         sess["pickup_name"] = text
 
@@ -764,7 +623,7 @@ def handle_message(event: MessageEvent):
         sess["state"] = "IDLE"
         return
 
-    # ---------- delivery name/phone/address ----------
+    # 宅配收件人/電話/地址
     if sess["state"] == "WAIT_DELIVERY_NAME":
         sess["delivery_name"] = text
         sess["state"] = "WAIT_DELIVERY_PHONE"
@@ -803,18 +662,164 @@ def handle_message(event: MessageEvent):
         sess["state"] = "IDLE"
         return
 
-    # ---------- payment confirm message ----------
+    # 轉帳回覆
     if text.startswith("已轉帳"):
-        reply_text(
-            event.reply_token,
-            "收到，我們會核對帳款後依訂單號安排出貨。\n"
-            "若需補充資訊，也可以直接在這裡留言。"
-        )
+        reply_text(event.reply_token, "收到，我們會核對帳款後依訂單號安排出貨。若需補充資訊也可在此留言。")
         return
 
-    # ---------- fallback ----------
-    reply_text(
-        event.reply_token,
-        "請輸入「甜點」或「下訂單」開啟選單。\n"
-        "或輸入：取貨說明 / 付款說明"
-    )
+    # fallback
+    reply_text(event.reply_token, "輸入「甜點」看菜單，或輸入「我要下單」開始。")
+
+
+# =========================
+# LINE Handlers — Postback（所有按鈕都走這裡，不會顯示程式碼）
+# =========================
+@handler.add(PostbackEvent)
+def handle_postback(event: PostbackEvent):
+    user_id = event.source.user_id
+    data = (event.postback.data or "").strip()
+    sess = get_session(user_id)
+    rt = event.reply_token
+
+    display_name = "LINE用戶"
+
+    # 開始下單（從菜單預覽按「我要下單」）
+    if data == "CMD:START_ORDER":
+        sess["state"] = "ORDERING"
+        show_order_menu(user_id, reply_token=rt)
+        return
+
+    # 清空
+    if data == "CMD:RESET":
+        reset_session(user_id)
+        reply_text(rt, "已清空。輸入「甜點」看菜單，或輸入「我要下單」開始。")
+        return
+
+    # 前往結帳
+    if data == "CMD:CHECKOUT":
+        if not sess["cart"]:
+            reply_text(rt, "你的購物車是空的，請先輸入「我要下單」選商品。")
+            return
+
+        pickup_flex = build_pickup_method_flex()
+        pickup_container = flex_container_from_dict(pickup_flex)
+        if not pickup_container:
+            reply_text(rt, "⚠️ 取貨卡片內容異常，請輸入「我要下單」再試一次。")
+            return
+
+        reply_messages(
+            rt,
+            [
+                TextMessage(text="好，接著選取貨方式。"),
+                FlexMessage(alt_text="取貨方式", contents=pickup_container),
+            ],
+        )
+        sess["state"] = "WAIT_PICKUP_METHOD"
+        return
+
+    # 取貨方式（postback data 直接用你原本格式）
+    if data.startswith("取貨:"):
+        method = data.split(":", 1)[1].strip()
+        if method not in ["店取", "宅配"]:
+            reply_flex_dict(rt, "取貨方式", build_pickup_method_flex())
+            return
+
+        sess["pickup_method"] = method
+
+        if method == "店取":
+            sess["state"] = "WAIT_PICKUP_DATE"
+            reply_text(
+                rt,
+                "店取：請輸入希望取貨日期（YYYY-MM-DD）\n"
+                "只能選 3～14 天內（甜點需提前 3 天預訂）。"
+            )
+            return
+
+        if method == "宅配":
+            sess["state"] = "WAIT_DELIVERY_DATE"
+            reply_text(
+                rt,
+                "宅配：請輸入「希望到貨日期」（YYYY-MM-DD）\n"
+                "只能選 3～14 天內（不保證準時到貨，僅作為希望日）。"
+            )
+            return
+
+    # 店取時段
+    if data.startswith("時段:") and sess.get("state") == "WAIT_PICKUP_TIME":
+        t = data.split(":", 1)[1].strip()
+        sess["pickup_time"] = t
+        sess["state"] = "WAIT_PICKUP_NAME"
+        reply_text(rt, "請輸入店取取件人姓名：")
+        return
+
+    # 選品項
+    if data.startswith("ITEM:"):
+        if sess.get("state") not in ["ORDERING", "WAIT_FLAVOR", "WAIT_QTY", "IDLE"]:
+            sess["state"] = "ORDERING"
+
+        item_key = data.split(":", 1)[1].strip()
+        if item_key not in ITEMS:
+            reply_text(rt, "品項不存在，請輸入「我要下單」重新開始。")
+            return
+
+        sess["pending_item"] = item_key
+        sess["pending_flavor"] = None
+
+        if ITEMS[item_key]["has_flavor"]:
+            reply_text(rt, f"你選了：{ITEMS[item_key]['label']}，請選口味。")
+            ask_flavor(user_id, item_key)  # push quick reply
+            sess["state"] = "WAIT_FLAVOR"
+        else:
+            reply_text(rt, f"你選了：{ITEMS[item_key]['label']}，請選數量。")
+            ask_qty(user_id, item_key)
+            sess["state"] = "WAIT_QTY"
+        return
+
+    # 選口味
+    if data.startswith("FLAVOR:"):
+        flavor = data.split(":", 1)[1].strip()
+        item_key = sess.get("pending_item")
+
+        if not item_key or item_key not in ITEMS:
+            reply_text(rt, "流程有點亂掉了，請輸入「我要下單」重新開始。")
+            return
+
+        if flavor not in ITEMS[item_key]["flavors"]:
+            reply_text(rt, "口味不正確，請重新選口味。")
+            ask_flavor(user_id, item_key)
+            return
+
+        sess["pending_flavor"] = flavor
+        reply_text(rt, f"口味：{flavor}\n請選數量。")
+        ask_qty(user_id, item_key)
+        sess["state"] = "WAIT_QTY"
+        return
+
+    # 選數量
+    if data.startswith("QTY:"):
+        qty = int(data.split(":", 1)[1].strip())
+        item_key = sess.get("pending_item")
+        flavor = sess.get("pending_flavor")
+
+        if not item_key or item_key not in ITEMS:
+            reply_text(rt, "流程有點亂掉了，請輸入「我要下單」重新開始。")
+            return
+
+        try:
+            add_to_cart(user_id, item_key, flavor, qty)
+        except Exception as e:
+            reply_text(rt, f"加入失敗：{e}\n請輸入「我要下單」重新開始。")
+            return
+
+        sess["pending_item"] = None
+        sess["pending_flavor"] = None
+        sess["state"] = "ORDERING"
+
+        total = cart_total(sess["cart"])
+        reply_text(rt, f"✅ 已加入購物車\n目前小計：{total}")
+
+        after_added_actions(user_id)  # push quick reply
+        return
+
+    # 沒匹配到
+    reply_text(rt, "輸入「甜點」看菜單，或輸入「我要下單」開始。")
