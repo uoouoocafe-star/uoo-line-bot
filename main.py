@@ -2,242 +2,291 @@ import os
 import json
 import base64
 import random
+import string
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import PlainTextResponse
 
 from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
+
 from linebot.v3.messaging import (
-    Configuration,
     ApiClient,
+    Configuration,
     MessagingApi,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage,
     FlexMessage,
-    FlexContainer,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# =========================
-# ENV
-# =========================
-CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN", "")
-CHANNEL_SECRET = os.getenv("CHANNEL_SECRET", "")
 
-GSHEET_ID = os.getenv("GSHEET_ID", "")
-GSHEET_SHEET_NAME = os.getenv("GSHEET_SHEET_NAME", "sheet1")
-GOOGLE_SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+# =========================
+# Config / Env
+# =========================
+CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN", "").strip()
+CHANNEL_SECRET = os.getenv("CHANNEL_SECRET", "").strip()
+
+GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+SHEET_NAME = os.getenv("SHEET_NAME", "sheet1").strip()
+
+TZ = timezone(timedelta(hours=8))  # Asia/Taipei
+
+
+# =========================
+# App / LINE clients
+# =========================
+app = FastAPI()
 
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
-    raise RuntimeError("Missing CHANNEL_ACCESS_TOKEN / CHANNEL_SECRET")
+    print("[WARN] Missing LINE env (CHANNEL_ACCESS_TOKEN/CHANNEL_SECRET). Bot will not reply.")
 
-TZ_TAIPEI = timezone(timedelta(hours=8))
+handler = WebhookHandler(CHANNEL_SECRET) if CHANNEL_SECRET else None
+
+line_config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+api_client = ApiClient(line_config)
+messaging_api = MessagingApi(api_client)
+
 
 # =========================
-# BUSINESS
+# In-memory session store (簡單版)
+# 你部署在 Render free 可能會重啟，購物車就會清掉（可接受先跑起來）
 # =========================
-STORE_ADDRESS = "新竹縣竹北市隘口六街65號"
-BANK_TEXT = "台灣銀行：004 248-001-03430-6"
+SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-SHIPPING_FEE = 180
-FREE_SHIPPING_THRESHOLD = 2500
+
+def get_session(user_id: str) -> Dict[str, Any]:
+    if user_id not in SESSIONS:
+        SESSIONS[user_id] = {
+            "cart": [],  # list of items
+            "state": "IDLE",
+            "pending_item": None,
+            "pending_flavor": None,
+            "pickup_method": None,  # 店取 / 宅配
+            "pickup_date": None,
+            "pickup_time": None,
+            "pickup_name": None,
+            "delivery_date": None,  # 希望到貨日期
+            "delivery_name": None,
+            "delivery_phone": None,
+            "delivery_address": None,
+            "note": "",
+        }
+    return SESSIONS[user_id]
+
+
+# =========================
+# Menu data
+# =========================
+DACQUOISE_FLAVORS = ["原味", "蜜香紅茶", "日式抹茶", "日式焙茶", "法芙娜可可"]
+TOAST_FLAVORS = ["原味", "蜜香紅茶", "日式抹茶", "日式焙茶", "法芙娜可可"]
 
 ITEMS = {
-    "dacquoise": {
-        "label": "達克瓦茲",
-        "unit_price": 95,
-        "has_flavor": True,
-        "min_qty": 2,
-        "flavors": [
-            ("original", "原味"),
-            ("black_tea", "蜜香紅茶"),
-            ("matcha", "日式抹茶"),
-            ("hojicha", "日式焙茶"),
-            ("cocoa", "法芙娜可可"),
-        ],
-        "note": "口味不可混（同一張訂單只能選一種口味）",
-    },
-    "scone": {
-        "label": "原味司康",
-        "unit_price": 65,
-        "has_flavor": False,
-        "min_qty": 1,
-        "flavors": [],
-        "note": "冷藏或冷凍保存",
-    },
-    "canele": {
-        "label": "原味可麗露",
-        "unit_price": 90,
-        "has_flavor": False,
-        "min_qty": 1,
-        "flavors": [],
-        "note": "限冷凍保存",
-    },
-    "toast": {
-        "label": "伊思尼奶酥厚片",
-        "unit_price": 85,
-        "has_flavor": True,
-        "min_qty": 1,
-        "flavors": [
-            ("original", "原味"),
-            ("black_tea", "蜜香紅茶"),
-            ("matcha", "日式抹茶"),
-            ("hojicha", "日式焙茶"),
-            ("cocoa", "法芙娜可可"),
-        ],
-        "note": "冷藏或冷凍保存",
-    },
+    "dacquoise": {"label": "達克瓦茲", "unit_price": 95, "has_flavor": True, "flavors": DACQUOISE_FLAVORS, "min_qty": 2},
+    "scone": {"label": "原味司康", "unit_price": 65, "has_flavor": False, "flavors": [], "min_qty": 1},
+    "canele": {"label": "原味可麗露", "unit_price": 90, "has_flavor": False, "flavors": [], "min_qty": 1},
+    "toast": {"label": "伊思尼奶酥厚片", "unit_price": 85, "has_flavor": True, "flavors": TOAST_FLAVORS, "min_qty": 1},
 }
 
-PICKUP_TIME_SLOTS = [
-    "10:00-12:00",
-    "12:00-14:00",
-    "14:00-16:00",
-    "16:00-18:00",
-]
+PICKUP_ADDRESS = "新竹縣竹北市隘口六街65號"
+
+BANK_TRANSFER_TEXT = (
+    "付款方式：轉帳（對帳後依訂單號出貨）\n"
+    "台灣銀行 004\n"
+    "帳號：248-001-03430-6\n\n"
+    "轉帳後請回傳：\n"
+    "「已轉帳 訂單編號 末五碼12345」"
+)
+
+DELIVERY_NOTICE = (
+    "宅配：一律冷凍宅配（大榮）\n"
+    "運費180元／滿2500免運\n\n"
+    "注意事項：\n"
+    "• 保持電話暢通（避免退件）\n"
+    "• 收到後立刻開箱確認並儘快冷凍/冷藏\n"
+    "• 若嚴重損壞請拍照（含原箱）並當日聯繫\n"
+    "• 未處理完前請保留原狀勿丟棄/食用\n\n"
+    "風險認知：\n"
+    "• 易碎品運送中輕微位移/裝飾掉落通常不在理賠範圍\n"
+    "• 天災可能導致延遲或停送，無法保證準時"
+)
+
+PICKUP_NOTICE = (
+    "店取地址：\n"
+    f"{PICKUP_ADDRESS}\n\n"
+    "提醒：所有甜點需提前3天預訂。"
+)
+
 
 # =========================
-# STATE (in-memory)
+# Google Sheets
 # =========================
-STATE: Dict[str, Dict[str, Any]] = {}
-# stages:
-# idle
-# await_delivery_name -> await_delivery_phone -> await_delivery_address
-# await_store_pickup_name
-# other picking via postback
-
-def get_user_state(user_id: str) -> Dict[str, Any]:
-    if user_id not in STATE:
-        STATE[user_id] = {
-            "stage": "idle",
-            "cart": [],
-            "dacquoise_flavor_locked": None,
-            "pickup_method": None,   # store|delivery
-            "pickup_date": None,     # YYYY-MM-DD
-            "pickup_time": None,     # slot
-            "note": "",              # for sheet (human readable)
-            "delivery": {"name": "", "phone": "", "address": ""},
-            "store": {"name": ""},
-        }
-    return STATE[user_id]
-
-
-def reset_order(user_id: str) -> None:
-    STATE[user_id] = {
-        "stage": "idle",
-        "cart": [],
-        "dacquoise_flavor_locked": None,
-        "pickup_method": None,
-        "pickup_date": None,
-        "pickup_time": None,
-        "note": "",
-        "delivery": {"name": "", "phone": "", "address": ""},
-        "store": {"name": ""},
-    }
-
-# =========================
-# Google Sheet
-# =========================
-def _load_service_account_info() -> Optional[dict]:
-    if GOOGLE_SERVICE_ACCOUNT_JSON.strip():
+def load_service_account_info() -> Optional[dict]:
+    if GOOGLE_SERVICE_ACCOUNT_B64:
+        try:
+            raw = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_B64.encode("utf-8")).decode("utf-8")
+            return json.loads(raw)
+        except Exception as e:
+            print("[ERROR] decode GOOGLE_SERVICE_ACCOUNT_B64 failed:", e)
+            return None
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
         try:
             return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        except Exception:
-            return None
-    if GOOGLE_SERVICE_ACCOUNT_B64.strip():
-        try:
-            raw = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_B64).decode("utf-8")
-            return json.loads(raw)
-        except Exception:
+        except Exception as e:
+            print("[ERROR] parse GOOGLE_SERVICE_ACCOUNT_JSON failed:", e)
             return None
     return None
 
 
-def append_order_row(row: List[Any]) -> None:
-    if not GSHEET_ID:
-        return
-    info = _load_service_account_info()
+def get_sheets_service():
+    info = load_service_account_info()
     if not info:
-        return
+        return None
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-    service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    sheet = service.spreadsheets()
 
-    rng = f"{GSHEET_SHEET_NAME}!A:Z"
-    body = {"values": [row]}
-    sheet.values().append(
-        spreadsheetId=GSHEET_ID,
-        range=rng,
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body=body,
-    ).execute()
+def append_order_row(row: List[Any]) -> bool:
+    if not GSHEET_ID:
+        print("[WARN] GSHEET_ID missing, skip append.")
+        return False
+
+    service = get_sheets_service()
+    if not service:
+        print("[WARN] Google Sheet env missing, skip append.")
+        return False
+
+    try:
+        range_ = f"{SHEET_NAME}!A1"
+        body = {"values": [row]}
+        service.spreadsheets().values().append(
+            spreadsheetId=GSHEET_ID,
+            range=range_,
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute()
+        return True
+    except Exception as e:
+        print("[ERROR] append_order_row failed:", e)
+        return False
+
 
 # =========================
-# LINE
+# Helpers
 # =========================
-configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
-app = FastAPI()
+def now_str() -> str:
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def gen_order_id() -> str:
+    d = datetime.now(TZ).strftime("%Y%m%d")
+    suffix = "".join(random.choices(string.digits, k=4))
+    return f"UOO-{d}-{suffix}"
+
+
+def cart_total(cart: List[dict]) -> int:
+    return sum(int(x.get("subtotal", 0)) for x in cart)
+
+
+def shipping_fee(total: int) -> int:
+    return 0 if total >= 2500 else 180
+
+
+def parse_date_yyyy_mm_dd(s: str) -> Optional[datetime]:
+    try:
+        dt = datetime.strptime(s.strip(), "%Y-%m-%d")
+        return dt.replace(tzinfo=TZ)
+    except Exception:
+        return None
+
+
+def date_in_range_3_to_14_days(dt: datetime) -> bool:
+    today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    min_d = today + timedelta(days=3)
+    max_d = today + timedelta(days=14)
+    target = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return min_d <= target <= max_d
+
 
 def reply_text(reply_token: str, text: str):
-    with ApiClient(configuration) as api_client:
-        api = MessagingApi(api_client)
-        api.reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=text)],
-            )
+    messaging_api.reply_message(
+        ReplyMessageRequest(
+            replyToken=reply_token,
+            messages=[TextMessage(text=text)],
         )
+    )
 
-def reply_flex(reply_token: str, alt_text: str, flex_obj: dict):
-    with ApiClient(configuration) as api_client:
-        api = MessagingApi(api_client)
-        api.reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[
-                    FlexMessage(
-                        alt_text=alt_text,
-                        contents=FlexContainer.from_dict(flex_obj),
-                    )
-                ],
-            )
+
+def push_text(user_id: str, text: str):
+    messaging_api.push_message(
+        PushMessageRequest(
+            to=user_id,
+            messages=[TextMessage(text=text)],
         )
+    )
 
-def safe_parse_postback(data: str) -> Dict[str, str]:
-    out = {}
-    for part in data.split("&"):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            out[k] = v
-    return out
 
-def generate_order_id() -> str:
-    now = datetime.now(TZ_TAIPEI)
-    ymd = now.strftime("%Y%m%d")
-    suffix = random.randint(1000, 9999)
-    return f"UOO-{ymd}-{suffix}"
+def reply_flex_json(reply_token: str, alt_text: str, flex_content: dict):
+    messaging_api.reply_message(
+        ReplyMessageRequest(
+            replyToken=reply_token,
+            messages=[
+                FlexMessage(
+                    altText=alt_text,
+                    contents=flex_content,
+                )
+            ],
+        )
+    )
 
-def lock_dacquoise_rule(st: Dict[str, Any], flavor_key: str) -> bool:
-    locked = st.get("dacquoise_flavor_locked")
-    if locked is None:
-        st["dacquoise_flavor_locked"] = flavor_key
-        return True
-    return locked == flavor_key
+
+def push_quick_reply(user_id: str, text: str, items: List[dict]):
+    # items: [{"label": "...", "text": "..."}]
+    qr = {
+        "type": "text",
+        "text": text,
+        "quickReply": {
+            "items": [
+                {
+                    "type": "action",
+                    "action": {"type": "message", "label": it["label"], "text": it["text"]},
+                }
+                for it in items
+            ]
+        },
+    }
+    messaging_api.push_message(
+        PushMessageRequest(
+            to=user_id,
+            messages=[qr],
+        )
+    )
+
 
 # =========================
-# FLEX BUILDERS
+# Flex builders
 # =========================
-def build_main_menu_flex() -> dict:
+def build_product_menu_flex() -> dict:
+    # 4 buttons + checkout / clear
+    def btn(label: str, text: str) -> dict:
+        return {
+            "type": "button",
+            "style": "primary",
+            "action": {"type": "message", "label": label, "text": text},
+        }
+
     return {
         "type": "bubble",
         "size": "mega",
@@ -246,565 +295,495 @@ def build_main_menu_flex() -> dict:
             "layout": "vertical",
             "spacing": "md",
             "contents": [
-                {"type": "text", "text": "UooUoo 甜點下單", "weight": "bold", "size": "xl"},
-                {"type": "text", "text": "請選擇服務：", "size": "sm", "color": "#666666"},
+                {"type": "text", "text": "請選擇商品", "weight": "bold", "size": "xl"},
+                {"type": "text", "text": "（全部甜點需提前 3 天預訂）", "size": "sm", "color": "#666666"},
+                btn("達克瓦茲｜NT$95", "ITEM:dacquoise"),
+                btn("原味司康｜NT$65", "ITEM:scone"),
+                btn("原味可麗露｜NT$90", "ITEM:canele"),
+                btn("伊思尼奶酥厚片｜NT$85", "ITEM:toast"),
                 {
-                    "type": "button",
-                    "style": "primary",
-                    "action": {"type": "postback", "label": "我要下單", "data": "action=start_order", "displayText": "我要下單"},
+                    "type": "separator",
+                    "margin": "lg",
                 },
                 {
                     "type": "button",
                     "style": "secondary",
-                    "action": {"type": "postback", "label": "取貨說明", "data": "action=pickup_info", "displayText": "取貨說明"},
+                    "action": {"type": "message", "label": "🧾 前往結帳", "text": "前往結帳"},
                 },
                 {
                     "type": "button",
                     "style": "secondary",
-                    "action": {"type": "postback", "label": "付款說明", "data": "action=pay_info", "displayText": "付款說明"},
+                    "action": {"type": "message", "label": "🗑 清空重來", "text": "清空重來"},
                 },
             ],
         },
-        "footer": {
+    }
+
+
+def build_pickup_method_flex() -> dict:
+    return {
+        "type": "bubble",
+        "body": {
             "type": "box",
             "layout": "vertical",
-            "contents": [{"type": "text", "text": "提醒：全部甜點需提前 3 天預訂", "size": "xs", "color": "#999999"}],
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": "取貨方式", "weight": "bold", "size": "xl"},
+                {
+                    "type": "text",
+                    "text": "請選擇店取或宅配",
+                    "size": "sm",
+                    "color": "#666666",
+                },
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "action": {"type": "message", "label": "🏪 店取", "text": "取貨:店取"},
+                },
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "action": {"type": "message", "label": "🚚 冷凍宅配", "text": "取貨:宅配"},
+                },
+            ],
         },
     }
 
-def build_item_picker_flex() -> dict:
-    buttons = []
-    for key in ["dacquoise", "scone", "canele", "toast"]:
-        item = ITEMS[key]
-        buttons.append(
-            {
-                "type": "button",
-                "style": "secondary",
-                "action": {"type": "postback", "label": f"{item['label']}｜NT${item['unit_price']}",
-                           "data": f"action=choose_item&item={key}", "displayText": item["label"]},
-            }
-        )
-    buttons += [
-        {"type": "button", "style": "primary", "action": {"type": "postback", "label": "前往結帳", "data": "action=checkout", "displayText": "前往結帳"}},
-        {"type": "button", "style": "link", "action": {"type": "postback", "label": "清空重來", "data": "action=reset", "displayText": "清空重來"}},
-    ]
-    return {
-        "type": "bubble",
-        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-            {"type": "text", "text": "請選擇商品", "weight": "bold", "size": "xl"},
-            {"type": "text", "text": "（全部甜點需提前 3 天預訂）", "size": "sm", "color": "#666666"},
-            {"type": "separator"},
-            *buttons,
-        ]},
-    }
-
-def build_flavor_picker_flex(item_key: str) -> dict:
-    item = ITEMS[item_key]
-    contents = [{"type": "text", "text": f"{item['label']}：請選口味", "weight": "bold", "size": "xl"}]
-    if item_key == "dacquoise":
-        contents.append({"type": "text", "text": "達克瓦茲口味不可混（同一張訂單只能一種口味）", "size": "sm", "color": "#C04A3A"})
-
-    btns = []
-    for f_key, f_label in item["flavors"]:
-        btns.append({"type": "button", "style": "secondary",
-                     "action": {"type": "postback", "label": f_label,
-                                "data": f"action=choose_flavor&item={item_key}&flavor={f_key}",
-                                "displayText": f_label}})
-    btns.append({"type": "button", "style": "link", "action": {"type": "postback", "label": "回上一頁", "data": "action=back_to_items", "displayText": "回上一頁"}})
-
-    return {"type": "bubble", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": contents + [{"type": "separator"}, *btns]}}
-
-def build_qty_picker_flex(item_key: str, flavor_key: Optional[str]) -> dict:
-    item = ITEMS[item_key]
-    title = item["label"]
-    flavor_label = None
-    if flavor_key:
-        flavor_label = next((lab for k, lab in item["flavors"] if k == flavor_key), flavor_key)
-        title = f"{title}（{flavor_label}）"
-
-    min_qty = item["min_qty"]
-    btns = []
-    for q in range(min_qty, 11):
-        btns.append({"type": "button", "style": "secondary",
-                     "action": {"type": "postback", "label": f"{q}",
-                                "data": f"action=choose_qty&item={item_key}&flavor={flavor_key or ''}&qty={q}",
-                                "displayText": f"{q} 個"}})
-
-    btns.append({"type": "button", "style": "link", "action": {"type": "postback", "label": "回上一頁", "data": f"action=back&item={item_key}", "displayText": "回上一頁"}})
-
-    return {"type": "bubble", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-        {"type": "text", "text": "請選數量", "weight": "bold", "size": "xl"},
-        {"type": "text", "text": title, "size": "sm", "color": "#666666"},
-        {"type": "separator"},
-        *btns,
-    ]}}
-
-def cart_summary_text(st: Dict[str, Any]) -> str:
-    if not st["cart"]:
-        return "購物車目前是空的。"
-    lines = ["✅ 已加入購物車："]
-    total = 0
-    for it in st["cart"]:
-        name = it["label"]
-        if it.get("flavor_label"):
-            name = f"{name}（{it['flavor_label']}）"
-        lines.append(f"- {name} x{it['qty']} = {it['subtotal']}")
-        total += it["subtotal"]
-    lines.append(f"\n目前小計：{total}")
-    lines.append("\n你可以繼續選商品，或按「前往結帳」。")
-    return "\n".join(lines)
-
-def build_delivery_method_flex() -> dict:
-    return {
-        "type": "bubble",
-        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-            {"type": "text", "text": "請選擇取貨方式", "weight": "bold", "size": "xl"},
-            {"type": "separator"},
-            {"type": "button", "style": "primary",
-             "action": {"type": "postback", "label": "店取（竹北）", "data": "action=pickup_method&method=store", "displayText": "店取"}},
-            {"type": "button", "style": "secondary",
-             "action": {"type": "postback", "label": "宅配（冷凍）", "data": "action=pickup_method&method=delivery", "displayText": "宅配"}},
-        ]},
-        "footer": {"type": "box", "layout": "vertical", "contents": [
-            {"type": "text", "text": "宅配：大榮冷凍運費 NT$180｜滿 2500 免運", "size": "xs", "color": "#999999"}
-        ]},
-    }
-
-def build_pickup_date_flex(method: str) -> dict:
-    today = datetime.now(TZ_TAIPEI).date()
-    start = today + timedelta(days=3)
-    end = today + timedelta(days=14)
-
-    title = "希望取貨日期" if method == "store" else "希望到貨日期（不保證準時）"
-    sub = "可選 3 天後～14 天內（實際依出貨/物流安排為準）"
-
-    buttons = []
-    d = start
-    while d <= end:
-        label = d.strftime("%m/%d (%a)")
-        iso = d.isoformat()
-        buttons.append({"type": "button", "style": "secondary",
-                        "action": {"type": "postback", "label": label,
-                                   "data": f"action=pickup_date&date={iso}",
-                                   "displayText": f"{title} {label}"}})
-        d += timedelta(days=1)
-
-    return {"type": "bubble", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-        {"type": "text", "text": title, "weight": "bold", "size": "xl"},
-        {"type": "text", "text": sub, "size": "sm", "color": "#666666"},
-        {"type": "separator"},
-        *buttons
-    ]}}
-
-def build_pickup_time_flex() -> dict:
-    btns = []
-    for slot in PICKUP_TIME_SLOTS:
-        btns.append({"type": "button", "style": "secondary",
-                     "action": {"type": "postback", "label": slot, "data": f"action=pickup_time&time={slot}",
-                                "displayText": f"取件時段 {slot}"}})
-    return {"type": "bubble", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-        {"type": "text", "text": "店取時段", "weight": "bold", "size": "xl"},
-        {"type": "text", "text": f"地址：{STORE_ADDRESS}", "size": "sm", "color": "#666666"},
-        {"type": "separator"},
-        *btns
-    ]}}
-
-def build_checkout_confirm_flex(st: Dict[str, Any]) -> dict:
-    subtotal = sum(it["subtotal"] for it in st["cart"])
-    shipping = 0
-    if st["pickup_method"] == "delivery":
-        shipping = 0 if subtotal >= FREE_SHIPPING_THRESHOLD else SHIPPING_FEE
-    total = subtotal + shipping
-
-    items_lines = []
-    for it in st["cart"]:
-        name = it["label"]
-        if it.get("flavor_label"):
-            name = f"{name}（{it['flavor_label']}）"
-        items_lines.append(f"{name} x{it['qty']}")
-    detail = "\n".join(items_lines) if items_lines else "-"
-
-    pm = "店取" if st["pickup_method"] == "store" else "宅配（冷凍）"
-    date_label = "希望取貨日" if st["pickup_method"] == "store" else "希望到貨日（不保證準時）"
-
-    return {
-        "type": "bubble",
-        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-            {"type": "text", "text": "結帳確認", "weight": "bold", "size": "xl"},
-            {"type": "text", "text": "商品：", "size": "sm", "color": "#666666"},
-            {"type": "text", "text": detail, "wrap": True},
-            {"type": "separator"},
-            {"type": "text", "text": f"取貨方式：{pm}", "wrap": True},
-            {"type": "text", "text": f"{date_label}：{st['pickup_date'] or ''}", "wrap": True},
-            *([{"type": "text", "text": f"店取時段：{st['pickup_time']}", "wrap": True}] if st["pickup_method"] == "store" else []),
-            {"type": "text", "text": f"收件/取件資訊：{(st.get('note') or '-')[:200]}", "wrap": True, "size": "sm", "color": "#666666"},
-            {"type": "separator"},
-            {"type": "text", "text": f"小計：NT${subtotal}", "wrap": True},
-            {"type": "text", "text": f"運費：NT${shipping}", "wrap": True},
-            {"type": "text", "text": f"總計：NT${total}", "wrap": True, "weight": "bold"},
-        ]},
-        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
-            {"type": "button", "style": "primary",
-             "action": {"type": "postback", "label": "確認送出訂單", "data": "action=place_order", "displayText": "確認送出訂單"}},
-            {"type": "button", "style": "link",
-             "action": {"type": "postback", "label": "回去繼續加購", "data": "action=back_to_items", "displayText": "回去加購"}},
-        ]},
-    }
-
-def build_payment_info_text() -> str:
-    return "\n".join([
-        "【付款方式】",
-        "1) 轉帳匯款",
-        f"- {BANK_TEXT}",
-        "",
-        "匯款後請回覆：",
-        "「已轉帳 訂單編號 XXXXX 後五碼 12345」",
-        "",
-        "（我們核對後會依訂單編號陸續出貨/備貨）",
-    ])
-
-def build_pickup_info_text() -> str:
-    return "\n".join([
-        "【取貨方式】",
-        f"店取：{STORE_ADDRESS}",
-        "",
-        "宅配：一律冷凍宅配（大榮）",
-        "• 保持電話暢通：避免無人收件退件",
-        "• 收到後立即開箱確認狀態，儘早冷藏/冷凍",
-        "• 若嚴重損壞（糊爛、不成形）請拍照（含原箱）並當日聯繫店家",
-        "• 未處理完前請保留原樣，勿丟棄/食用",
-        "",
-        "【風險認知】",
-        "• 輕微位移、裝飾掉落通常不在理賠範圍，請理解並自行承擔",
-        "• 天災可能導致物流延遲或暫停，無法保證準時送達",
-    ])
 
 # =========================
-# FASTAPI
+# Business logic
+# =========================
+def show_product_menu(user_id: str, reply_token: Optional[str] = None):
+    flex = build_product_menu_flex()
+    if reply_token:
+        reply_flex_json(reply_token, "甜點選單", flex)
+    else:
+        messaging_api.push_message(
+            PushMessageRequest(
+                to=user_id,
+                messages=[FlexMessage(altText="甜點選單", contents=flex)],
+            )
+        )
+
+
+def ask_flavor(user_id: str, item_key: str):
+    flavors = ITEMS[item_key]["flavors"]
+    items = [{"label": f, "text": f"FLAVOR:{f}"} for f in flavors]
+    push_quick_reply(user_id, "你選了，請選口味：", items)
+
+
+def ask_qty(user_id: str, item_key: str):
+    min_qty = ITEMS[item_key]["min_qty"]
+    # 做 2~12 或 1~12
+    start = min_qty
+    end = 12
+    items = [{"label": str(i), "text": f"QTY:{i}"} for i in range(start, end + 1)]
+    push_quick_reply(user_id, f"請選數量（最少 {min_qty}）：", items)
+
+
+def add_to_cart(user_id: str, item_key: str, flavor: Optional[str], qty: int):
+    sess = get_session(user_id)
+    meta = ITEMS[item_key]
+    unit = meta["unit_price"]
+    label = meta["label"]
+
+    if meta["has_flavor"] and not flavor:
+        raise ValueError("missing flavor")
+
+    if qty < meta["min_qty"]:
+        raise ValueError(f"qty must be >= {meta['min_qty']}")
+
+    # 達克瓦茲「口味不可混」：這裡做法是每一筆都綁定一個 flavor，自然不會混
+    subtotal = unit * qty
+    sess["cart"].append(
+        {
+            "item_key": item_key,
+            "label": label,
+            "flavor": flavor or "",
+            "qty": qty,
+            "unit_price": unit,
+            "subtotal": subtotal,
+        }
+    )
+
+
+def cart_summary_text(cart: List[dict]) -> str:
+    lines = []
+    for x in cart:
+        name = x["label"]
+        if x.get("flavor"):
+            name += f"（{x['flavor']}）"
+        lines.append(f"- {name} x{x['qty']} = {x['subtotal']}")
+    total = cart_total(cart)
+    return "\n".join(lines) + f"\n\n目前小計：{total}"
+
+
+def after_added_actions(user_id: str):
+    # 加購 or 結帳 quick reply
+    push_quick_reply(
+        user_id,
+        "請選擇下一步 👇",
+        [
+            {"label": "➕ 繼續加購", "text": "甜點"},
+            {"label": "🧾 前往結帳", "text": "前往結帳"},
+        ],
+    )
+
+
+def create_order_and_write_sheet(user_id: str, display_name: str) -> str:
+    sess = get_session(user_id)
+    cart = sess["cart"]
+    if not cart:
+        return ""
+
+    order_id = gen_order_id()
+    total = cart_total(cart)
+
+    pickup_method = sess.get("pickup_method", "")
+    pickup_date = sess.get("pickup_date", "")
+    pickup_time = sess.get("pickup_time", "")
+    note = sess.get("note", "")
+
+    # 宅配：把地址/電話/姓名一起塞在 note 裡（簡單好查）
+    if pickup_method == "宅配":
+        delivery_date = sess.get("delivery_date", "")
+        dn = sess.get("delivery_name", "")
+        dp = sess.get("delivery_phone", "")
+        da = sess.get("delivery_address", "")
+        note = (note + " | " if note else "") + f"希望到貨:{delivery_date} | 收件人:{dn} | 電話:{dp} | 地址:{da}"
+        # pickup_date 欄位改存希望到貨日期，方便你在表格看
+        pickup_date = delivery_date
+        pickup_time = ""
+
+    # 店取：把取件人姓名寫入 note（你希望店取要收取件人姓名）
+    if pickup_method == "店取":
+        pn = sess.get("pickup_name", "")
+        note = (note + " | " if note else "") + f"取件人:{pn}"
+
+    row = [
+        now_str(),          # created_at
+        user_id,            # user_id
+        display_name,       # display_name
+        order_id,           # order_id
+        json.dumps({"cart": cart}, ensure_ascii=False),  # items_json
+        pickup_method,      # pickup_method
+        pickup_date,        # pickup_date (宅配＝希望到貨日期)
+        pickup_time,        # pickup_time
+        note,               # note
+        total,              # amount
+        "UNPAID",           # pay_status
+        "",                 # linepay_transaction_id (先留空)
+    ]
+
+    ok = append_order_row(row)
+    if not ok:
+        print("[WARN] write sheet failed (but continue).")
+
+    return order_id
+
+
+# =========================
+# Routes
 # =========================
 @app.get("/")
-def health():
-    return {"ok": True}
+def root():
+    return {"ok": True, "service": "uoo-line-bot"}
+
 
 @app.post("/callback")
 async def callback(request: Request):
+    if not handler:
+        raise HTTPException(status_code=500, detail="LINE handler not configured")
+
     signature = request.headers.get("X-Line-Signature", "")
     body = await request.body()
     body_text = body.decode("utf-8")
+
     try:
         handler.handle(body_text, signature)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return "OK"
+    except InvalidSignatureError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    return PlainTextResponse("OK")
+
 
 # =========================
-# HANDLERS
+# LINE Webhook Handlers
 # =========================
 @handler.add(MessageEvent, message=TextMessageContent)
-def on_message(event: MessageEvent):
+def handle_message(event: MessageEvent):
     user_id = event.source.user_id
-    text = (event.message.text or "").strip()
-    st = get_user_state(user_id)
-        # === Rich Menu 若是「送文字」，就走這裡（文字=按鈕）===
-    if text in ["選單", "menu", "開始", "嗨", "hi", "你好"]:
-        reply_flex(event.reply_token, "選單", build_main_menu_flex())
+    text = event.message.text.strip()
+    sess = get_session(user_id)
+
+    # 取 display name（可先不用抓 profile，避免多 API）
+    display_name = "LINE用戶"
+
+    # ---------- global commands ----------
+    if text in ["清空重來", "清空", "reset"]:
+        sess["cart"] = []
+        sess["state"] = "IDLE"
+        sess["pending_item"] = None
+        sess["pending_flavor"] = None
+        sess["pickup_method"] = None
+        sess["pickup_date"] = None
+        sess["pickup_time"] = None
+        sess["pickup_name"] = None
+        sess["delivery_date"] = None
+        sess["delivery_name"] = None
+        sess["delivery_phone"] = None
+        sess["delivery_address"] = None
+        sess["note"] = ""
+        reply_text(event.reply_token, "已清空，重新開始。輸入「甜點」開啟選單。")
         return
 
-    if text in ["我要下單", "下單", "開始下單"]:
-        reset_order(user_id)
-        reply_text(event.reply_token, "好的，開始下單。先選商品（可多次加購）：")
-        reply_flex(event.reply_token, "選商品", build_item_picker_flex())
+    if text in ["甜點", "我要下單", "選單"]:
+        show_product_menu(user_id, reply_token=event.reply_token)
         return
 
-    if text in ["取貨說明", "取貨", "宅配說明", "店取說明"]:
-        reply_text(event.reply_token, build_pickup_info_text())
+    if text in ["取貨說明"]:
+        reply_text(event.reply_token, PICKUP_NOTICE + "\n\n" + DELIVERY_NOTICE)
         return
 
-    if text in ["付款說明", "付款", "匯款說明", "轉帳說明"]:
-        reply_text(event.reply_token, build_payment_info_text())
+    if text in ["付款說明"]:
+        reply_text(event.reply_token, BANK_TRANSFER_TEXT)
         return
 
-    if text in ["甜點", "甜點菜單", "菜單"]:
-        reply_flex(event.reply_token, "選商品", build_item_picker_flex())
-        return
-
-    # 入口
-    if text in ["選單", "menu", "開始", "嗨", "hi", "你好"]:
-        reply_flex(event.reply_token, "選單", build_main_menu_flex())
-        return
-
-    # 付款回報
-    if text.startswith("已轉帳"):
-        tokens = text.replace("：", " ").replace("，", " ").split()
-        order_id = None
-        last5 = None
-        for i, t in enumerate(tokens):
-            if t in ["訂單編號", "訂單", "order", "ORDER"] and i + 1 < len(tokens):
-                order_id = tokens[i + 1]
-            if t in ["後五碼", "後5碼", "末五碼"] and i + 1 < len(tokens):
-                last5 = tokens[i + 1]
-
-        if not order_id or not last5:
-            reply_text(event.reply_token, "格式不完整。\n請回覆：已轉帳 訂單編號 XXXXX 後五碼 12345")
-            return
-
-        created_at = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
-        row = [created_at, user_id, "(unknown)", order_id, "", "", "", "", f"PAY_REPORTED last5={last5}", "", "PAID_REPORTED", ""]
-        append_order_row(row)
-
-        reply_text(event.reply_token, f"收到你的轉帳回報✅\n訂單：{order_id}\n後五碼：{last5}\n\n我們核對後會依訂單編號安排出貨/備貨。")
-        return
-
-    # 宅配逐步表單
-    if st["stage"] == "await_delivery_name":
-        st["delivery"]["name"] = text
-        st["stage"] = "await_delivery_phone"
-        reply_text(event.reply_token, "收到✅ 請輸入「收件人電話」（例：0912xxxxxx）")
-        return
-
-    if st["stage"] == "await_delivery_phone":
-        st["delivery"]["phone"] = text
-        st["stage"] = "await_delivery_address"
-        reply_text(event.reply_token, "收到✅ 請輸入「冷凍宅配地址」（請完整：縣市＋路名＋號＋樓層）")
-        return
-
-    if st["stage"] == "await_delivery_address":
-        st["delivery"]["address"] = text
-        st["note"] = f"收件人：{st['delivery']['name']}｜電話：{st['delivery']['phone']}｜地址：{st['delivery']['address']}"
-        st["stage"] = "idle"
-        reply_text(event.reply_token, "已收齊宅配資訊✅\n接著請選「希望到貨日期（不保證準時）」。")
-        reply_flex(event.reply_token, "希望到貨日期", build_pickup_date_flex("delivery"))
-        return
-
-    # 店取取件人
-    if st["stage"] == "await_store_pickup_name":
-        st["store"]["name"] = text
-        st["note"] = f"取件人：{st['store']['name']}"
-        st["stage"] = "idle"
-        reply_text(event.reply_token, "已收到取件人姓名✅\n接著請選「希望取貨日期」。")
-        reply_flex(event.reply_token, "希望取貨日期", build_pickup_date_flex("store"))
-        return
-
-    # 其他文字
-    reply_text(event.reply_token, "請輸入「選單」開啟按鈕。\n（我要下單 / 取貨說明 / 付款說明）")
-
-@handler.add(PostbackEvent)
-def on_postback(event: PostbackEvent):
-    user_id = event.source.user_id
-    st = get_user_state(user_id)
-
-    q = safe_parse_postback(event.postback.data or "")
-    action = q.get("action", "")
-
-    if action == "pickup_info":
-        reply_text(event.reply_token, build_pickup_info_text())
-        return
-
-    if action == "pay_info":
-        reply_text(event.reply_token, build_payment_info_text())
-        return
-
-    if action == "start_order":
-        reset_order(user_id)
-        reply_text(event.reply_token, "好的，開始下單。先選商品（可多次加購）：")
-        reply_flex(event.reply_token, "選商品", build_item_picker_flex())
-        return
-
-    if action == "reset":
-        reset_order(user_id)
-        reply_text(event.reply_token, "已清空✅ 重新開始下單。")
-        reply_flex(event.reply_token, "選商品", build_item_picker_flex())
-        return
-
-    if action == "back_to_items":
-        reply_flex(event.reply_token, "選商品", build_item_picker_flex())
-        return
-
-    if action == "choose_item":
-        item_key = q.get("item", "")
-        if item_key not in ITEMS:
-            reply_text(event.reply_token, "商品不存在，請重新選擇。")
-            reply_flex(event.reply_token, "選商品", build_item_picker_flex())
-            return
-        item = ITEMS[item_key]
-        if item["has_flavor"]:
-            reply_flex(event.reply_token, "選口味", build_flavor_picker_flex(item_key))
-        else:
-            reply_flex(event.reply_token, "選數量", build_qty_picker_flex(item_key, None))
-        return
-
-    if action == "choose_flavor":
-        item_key = q.get("item", "")
-        flavor_key = q.get("flavor", "")
-        if item_key not in ITEMS:
-            reply_text(event.reply_token, "商品不存在，請重新選擇。")
-            reply_flex(event.reply_token, "選商品", build_item_picker_flex())
-            return
-
-        if item_key == "dacquoise":
-            if not lock_dacquoise_rule(st, flavor_key):
-                locked = st.get("dacquoise_flavor_locked")
-                locked_label = next((lab for k, lab in ITEMS["dacquoise"]["flavors"] if k == locked), locked)
-                reply_text(event.reply_token, f"這張訂單的達克瓦茲口味已鎖定為「{locked_label}」。\n如要換口味，請先按「清空重來」。")
-                reply_flex(event.reply_token, "選商品", build_item_picker_flex())
-                return
-
-        reply_flex(event.reply_token, "選數量", build_qty_picker_flex(item_key, flavor_key))
-        return
-
-    if action == "choose_qty":
-        item_key = q.get("item", "")
-        flavor_key = (q.get("flavor", "") or None)
-        qty = int(q.get("qty", "0") or "0")
-
-        if item_key not in ITEMS:
-            reply_text(event.reply_token, "商品不存在，請重新選擇。")
-            reply_flex(event.reply_token, "選商品", build_item_picker_flex())
-            return
-
-        item = ITEMS[item_key]
-        if qty < item["min_qty"]:
-            reply_text(event.reply_token, f"{item['label']} 最少購買數量為 {item['min_qty']}。")
-            return
-
-        flavor_label = None
-        if flavor_key:
-            flavor_label = next((lab for k, lab in item["flavors"] if k == flavor_key), flavor_key)
-
-        subtotal = qty * item["unit_price"]
-        st["cart"].append({
-            "item_key": item_key,
-            "label": item["label"],
-            "flavor": flavor_key,
-            "flavor_label": flavor_label,
-            "qty": qty,
-            "unit_price": item["unit_price"],
-            "subtotal": subtotal,
-        })
-
-        reply_text(event.reply_token, cart_summary_text(st))
-        reply_flex(event.reply_token, "選商品", build_item_picker_flex())
-        return
-
-    if action == "checkout":
-        if not st["cart"]:
-            reply_text(event.reply_token, "購物車是空的，請先選商品。")
-            reply_flex(event.reply_token, "選商品", build_item_picker_flex())
+    # ---------- checkout entry ----------
+    if text == "前往結帳":
+        if not sess["cart"]:
+            reply_text(event.reply_token, "你的購物車是空的，先輸入「甜點」選商品。")
             return
         reply_text(event.reply_token, "好，接著選取貨方式。")
-        reply_flex(event.reply_token, "取貨方式", build_delivery_method_flex())
+        reply_flex_json(event.reply_token, "取貨方式", build_pickup_method_flex())
+        sess["state"] = "WAIT_PICKUP_METHOD"
         return
 
-    if action == "pickup_method":
-        method = q.get("method", "")
-        if method not in ["store", "delivery"]:
-            reply_text(event.reply_token, "取貨方式錯誤，請重新選擇。")
-            reply_flex(event.reply_token, "取貨方式", build_delivery_method_flex())
+    # ---------- item selection ----------
+    if text.startswith("ITEM:"):
+        item_key = text.split(":", 1)[1].strip()
+        if item_key not in ITEMS:
+            reply_text(event.reply_token, "品項不存在，請重新輸入「甜點」。")
             return
+        sess["pending_item"] = item_key
+        sess["pending_flavor"] = None
 
-        st["pickup_method"] = method
-
-        if method == "delivery":
-            st["stage"] = "await_delivery_name"
-            reply_text(event.reply_token, "請輸入「宅配收件人姓名」（必填）")
-            return
-
-        # store
-        st["stage"] = "await_store_pickup_name"
-        reply_text(event.reply_token, "請輸入「店取取件人姓名」（必填）")
+        if ITEMS[item_key]["has_flavor"]:
+            reply_text(event.reply_token, f"你選了：{ITEMS[item_key]['label']}，請選口味。")
+            ask_flavor(user_id, item_key)
+            sess["state"] = "WAIT_FLAVOR"
+        else:
+            reply_text(event.reply_token, f"你選了：{ITEMS[item_key]['label']}，請選數量。")
+            ask_qty(user_id, item_key)
+            sess["state"] = "WAIT_QTY"
         return
 
-    if action == "pickup_date":
-        st["pickup_date"] = q.get("date", "")
-
-        if st["pickup_method"] == "store":
-            reply_text(event.reply_token, "請選店取時段：")
-            reply_flex(event.reply_token, "店取時段", build_pickup_time_flex())
+    # ---------- flavor ----------
+    if text.startswith("FLAVOR:"):
+        flavor = text.split(":", 1)[1].strip()
+        item_key = sess.get("pending_item")
+        if not item_key or item_key not in ITEMS:
+            reply_text(event.reply_token, "流程有點亂掉了，請輸入「甜點」重新開始。")
             return
 
-        # delivery -> directly confirm
-        reply_text(event.reply_token, "收到希望到貨日✅ 接著請確認結帳內容。")
-        reply_flex(event.reply_token, "結帳確認", build_checkout_confirm_flex(st))
+        if flavor not in ITEMS[item_key]["flavors"]:
+            reply_text(event.reply_token, "口味不正確，請重新選口味。")
+            ask_flavor(user_id, item_key)
+            return
+
+        sess["pending_flavor"] = flavor
+        reply_text(event.reply_token, f"口味：{flavor}\n請選數量。")
+        ask_qty(user_id, item_key)
+        sess["state"] = "WAIT_QTY"
         return
 
-    if action == "pickup_time":
-        st["pickup_time"] = q.get("time", "")
-        # append to note
-        st["note"] = f"{st['note']}｜店取時段：{st['pickup_time']}"
-        reply_text(event.reply_token, "收到店取時段✅ 接著請確認結帳內容。")
-        reply_flex(event.reply_token, "結帳確認", build_checkout_confirm_flex(st))
-        return
-
-    if action == "place_order":
-        if not st["cart"] or not st["pickup_method"] or not st["pickup_date"]:
-            reply_text(event.reply_token, "訂單資料不完整，請重新進入「我要下單」。")
-            reply_flex(event.reply_token, "選單", build_main_menu_flex())
+    # ---------- qty ----------
+    if text.startswith("QTY:"):
+        qty_raw = text.split(":", 1)[1].strip()
+        try:
+            qty = int(qty_raw)
+        except Exception:
+            reply_text(event.reply_token, "數量格式錯誤，請重新選數量。")
             return
-        if st["pickup_method"] == "store" and not st["pickup_time"]:
-            reply_text(event.reply_token, "店取需要選擇時段，請重新選擇。")
-            reply_flex(event.reply_token, "店取時段", build_pickup_time_flex())
+
+        item_key = sess.get("pending_item")
+        if not item_key or item_key not in ITEMS:
+            reply_text(event.reply_token, "流程有點亂掉了，請輸入「甜點」重新開始。")
             return
-        if st["pickup_method"] == "delivery":
-            d = st["delivery"]
-            if not (d["name"] and d["phone"] and d["address"]):
-                reply_text(event.reply_token, "宅配資訊未填完（姓名/電話/地址）。請重新下單。")
-                reply_flex(event.reply_token, "選單", build_main_menu_flex())
-                return
 
-        order_id = generate_order_id()
-        created_at = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+        flavor = sess.get("pending_flavor")
 
-        subtotal = sum(it["subtotal"] for it in st["cart"])
-        shipping = 0
-        if st["pickup_method"] == "delivery":
-            shipping = 0 if subtotal >= FREE_SHIPPING_THRESHOLD else SHIPPING_FEE
-        total = subtotal + shipping
+        try:
+            add_to_cart(user_id, item_key, flavor, qty)
+        except Exception as e:
+            reply_text(event.reply_token, f"加入失敗：{e}\n請重新選擇。輸入「甜點」開始。")
+            return
 
-        items_json = json.dumps(
-            {"cart": st["cart"], "subtotal": subtotal, "shipping": shipping, "total": total},
-            ensure_ascii=False
+        # 清 pending
+        sess["pending_item"] = None
+        sess["pending_flavor"] = None
+        sess["state"] = "IDLE"
+
+        # 回覆加入購物車 + 小計
+        meta = ITEMS[item_key]
+        name = meta["label"] + (f"（{flavor}）" if flavor else "")
+        subtotal = meta["unit_price"] * qty
+        total = cart_total(sess["cart"])
+
+        reply_text(
+            event.reply_token,
+            "✅ 已加入購物車\n"
+            f"- {name} x{qty} = {subtotal}\n\n"
+            f"目前小計：{total}"
         )
 
-        pickup_method_label = "店取" if st["pickup_method"] == "store" else "宅配"
-        pay_status = "UNPAID"
-
-        row = [
-            created_at,
-            user_id,
-            "(unknown)",
-            order_id,
-            items_json,
-            pickup_method_label,
-            st["pickup_date"],
-            st["pickup_time"] or "",
-            st.get("note", ""),
-            total,
-            pay_status,
-            "",
-        ]
-        append_order_row(row)
-
-        date_label = "希望取貨日" if st["pickup_method"] == "store" else "希望到貨日（不保證準時）"
-        pm_text = "店取" if st["pickup_method"] == "store" else "宅配（冷凍）"
-        fee_text = f"運費 NT${shipping}" if st["pickup_method"] == "delivery" else "運費 NT$0"
-
-        msg = "\n".join([
-            "✅ 訂單已建立",
-            f"訂單編號：{order_id}",
-            f"取貨方式：{pm_text}",
-            f"{date_label}：{st['pickup_date']}",
-            *( [f"店取時段：{st['pickup_time']}"] if st["pickup_method"] == "store" else [] ),
-            f"總計：NT${total}（{fee_text}）",
-            "",
-            "【付款方式】轉帳匯款",
-            f"- {BANK_TEXT}",
-            "",
-            "匯款後請回覆：",
-            f"已轉帳 訂單編號 {order_id} 後五碼 12345",
-        ])
-        reply_text(event.reply_token, msg)
-
-        reset_order(user_id)
+        # 重要：加購 / 結帳選擇（用 push，避免跟 reply token 混亂）
+        after_added_actions(user_id)
         return
 
-    reply_text(event.reply_token, "我沒看懂這個操作，請輸入「選單」回到主選單。")
+    # ---------- pickup method ----------
+    if text.startswith("取貨:"):
+        method = text.split(":", 1)[1].strip()
+        if method not in ["店取", "宅配"]:
+            reply_text(event.reply_token, "取貨方式不正確，請重新選擇。")
+            reply_flex_json(event.reply_token, "取貨方式", build_pickup_method_flex())
+            return
+
+        sess["pickup_method"] = method
+
+        if method == "店取":
+            sess["state"] = "WAIT_PICKUP_DATE"
+            reply_text(
+                event.reply_token,
+                "店取：請輸入希望取貨日期（YYYY-MM-DD）\n"
+                "只能選 3～14 天內（甜點需提前 3 天預訂）。"
+            )
+            return
+
+        if method == "宅配":
+            sess["state"] = "WAIT_DELIVERY_DATE"
+            reply_text(
+                event.reply_token,
+                "宅配：請輸入「希望到貨日期」（YYYY-MM-DD）\n"
+                "只能選 3～14 天內（不保證準時到貨，僅作為希望日）。"
+            )
+            return
+
+    # ---------- date input ----------
+    if sess["state"] in ["WAIT_PICKUP_DATE", "WAIT_DELIVERY_DATE"]:
+        dt = parse_date_yyyy_mm_dd(text)
+        if not dt:
+            reply_text(event.reply_token, "日期格式請用 YYYY-MM-DD，例如 2026-01-15")
+            return
+
+        if not date_in_range_3_to_14_days(dt):
+            reply_text(event.reply_token, "日期需在 3～14 天內，請重新輸入 YYYY-MM-DD")
+            return
+
+        if sess["state"] == "WAIT_PICKUP_DATE":
+            sess["pickup_date"] = dt.strftime("%Y-%m-%d")
+            sess["state"] = "WAIT_PICKUP_TIME"
+            push_quick_reply(
+                user_id,
+                "請選店取時段：",
+                [
+                    {"label": "10:00-12:00", "text": "時段:10:00-12:00"},
+                    {"label": "12:00-14:00", "text": "時段:12:00-14:00"},
+                    {"label": "14:00-16:00", "text": "時段:14:00-16:00"},
+                ],
+            )
+            reply_text(event.reply_token, "已收到取貨日期，請選時段（上方按鈕）。")
+            return
+
+        if sess["state"] == "WAIT_DELIVERY_DATE":
+            sess["delivery_date"] = dt.strftime("%Y-%m-%d")
+            sess["state"] = "WAIT_DELIVERY_NAME"
+            reply_text(event.reply_token, "請輸入宅配收件人姓名：")
+            return
+
+    # ---------- pickup time ----------
+    if text.startswith("時段:") and sess["state"] == "WAIT_PICKUP_TIME":
+        t = text.split(":", 1)[1].strip()
+        sess["pickup_time"] = t
+        sess["state"] = "WAIT_PICKUP_NAME"
+        reply_text(event.reply_token, "請輸入店取取件人姓名：")
+        return
+
+    # ---------- pickup name ----------
+    if sess["state"] == "WAIT_PICKUP_NAME":
+        sess["pickup_name"] = text
+        sess["state"] = "CONFIRM"
+        order_id = create_order_and_write_sheet(user_id, display_name)
+
+        total = cart_total(sess["cart"])
+        summary = cart_summary_text(sess["cart"])
+
+        reply_text(
+            event.reply_token,
+            "✅ 訂單已建立\n"
+            f"訂單編號：{order_id}\n\n"
+            f"{summary}\n\n"
+            f"取貨方式：店取\n取貨日期：{sess['pickup_date']}\n取貨時段：{sess['pickup_time']}\n"
+            f"店取地址：{PICKUP_ADDRESS}\n\n"
+            + BANK_TRANSFER_TEXT
+        )
+        # 訂單完成後清空購物車（避免重複）
+        sess["cart"] = []
+        sess["state"] = "IDLE"
+        return
+
+    # ---------- delivery name/phone/address ----------
+    if sess["state"] == "WAIT_DELIVERY_NAME":
+        sess["delivery_name"] = text
+        sess["state"] = "WAIT_DELIVERY_PHONE"
+        reply_text(event.reply_token, "請輸入宅配電話：")
+        return
+
+    if sess["state"] == "WAIT_DELIVERY_PHONE":
+        sess["delivery_phone"] = text
+        sess["state"] = "WAIT_DELIVERY_ADDRESS"
+        reply_text(event.reply_token, "請輸入宅配地址（完整地址）：")
+        return
+
+    if sess["state"] == "WAIT_DELIVERY_ADDRESS":
+        sess["delivery_address"] = text
+        sess["state"] = "CONFIRM"
+        order_id = create_order_and_write_sheet(user_id, display_name)
+
+        total = cart_total(sess["cart"])
+        fee = shipping_fee(total)
+        grand = total + fee
+
+        summary = cart_summary_text(sess["cart"])
+
+        reply_text(
+            event.reply_token,
+            "✅ 訂單已建立\n"
+            f"訂單編號：{order_id}\n\n"
+            f"{summary}\n\n"
+            f"取貨方式：冷凍宅配\n希望到貨日期：{sess['delivery_date']}（不保證準時）\n"
+            f"運費：{fee}\n應付總額：{grand}\n\n"
+            f"收件人：{sess['delivery_name']}\n電話：{sess['delivery_phone']}\n地址：{sess['delivery_address']}\n\n"
+            + DELIVERY_NOTICE
+            + "\n\n"
+            + BANK_TRANSFER_TEXT
+        )
+        sess["cart"] = []
+        sess["state"] = "IDLE"
+        return
+
+    # ---------- payment confirm message (optional) ----------
+    if text.startswith("已轉帳"):
+        reply_text(
+            event.reply_token,
+            "收到，我們會核對帳款後依訂單號安排出貨。\n"
+            "若需補充資訊，也可以直接在這裡留言。"
+        )
+        return
+
+    # ---------- fallback ----------
+    reply_text(
+        event.reply_token,
+        "請輸入「甜點」開啟選單。\n"
+        "或輸入：取貨說明 / 付款說明"
+    )
