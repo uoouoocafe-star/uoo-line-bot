@@ -11,11 +11,7 @@ from fastapi.responses import PlainTextResponse
 
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import (
-    MessageEvent,
-    TextMessageContent,
-    PostbackEvent,
-)
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent
 
 from linebot.v3.messaging import (
     ApiClient,
@@ -27,7 +23,6 @@ from linebot.v3.messaging import (
     FlexMessage,
     QuickReply,
     QuickReplyItem,
-    MessageAction,
     PostbackAction,
 )
 
@@ -45,10 +40,11 @@ GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
-# ✅ 不要預設 sheet1，避免你又踩回去
-SHEET_NAME = os.getenv("SHEET_NAME", "").strip()
+SHEET_NAME = os.getenv("SHEET_NAME", "orders").strip()
 
 TZ = timezone(timedelta(hours=8))  # Asia/Taipei
+
+MAX_EDIT_CAROUSEL = 10  # ✅ 你要 10 張
 
 
 # =========================
@@ -68,7 +64,6 @@ messaging_api = MessagingApi(api_client)
 
 # =========================
 # In-memory session store
-# （Render free 可能重啟會清空，先讓你跑起來）
 # =========================
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
@@ -77,7 +72,7 @@ def get_session(user_id: str) -> Dict[str, Any]:
     if user_id not in SESSIONS:
         SESSIONS[user_id] = {
             "cart": [],
-            "state": "IDLE",              # IDLE / ORDERING / WAIT_FLAVOR / WAIT_QTY / WAIT_PICKUP_METHOD / ...
+            "state": "IDLE",              # IDLE / ORDERING / WAIT_FLAVOR / WAIT_QTY / ...
             "pending_item": None,
             "pending_flavor": None,
 
@@ -100,11 +95,44 @@ def get_session(user_id: str) -> Dict[str, Any]:
 DACQUOISE_FLAVORS = ["原味", "蜜香紅茶", "日式抹茶", "日式焙茶", "法芙娜可可"]
 TOAST_FLAVORS = ["原味", "蜜香紅茶", "日式抹茶", "日式焙茶", "法芙娜可可"]
 
+# ✅ 可麗露改成 6顆/盒 NT$490，只能整盒
 ITEMS = {
-    "dacquoise": {"label": "達克瓦茲", "unit_price": 95, "has_flavor": True, "flavors": DACQUOISE_FLAVORS, "min_qty": 2},
-    "scone": {"label": "原味司康", "unit_price": 65, "has_flavor": False, "flavors": [], "min_qty": 1},
-    "canele": {"label": "原味可麗露", "unit_price": 90, "has_flavor": False, "flavors": [], "min_qty": 1},
-    "toast": {"label": "伊思尼奶酥厚片", "unit_price": 85, "has_flavor": True, "flavors": TOAST_FLAVORS, "min_qty": 1},
+    "dacquoise": {
+        "label": "達克瓦茲",
+        "unit_price": 95,
+        "has_flavor": True,
+        "flavors": DACQUOISE_FLAVORS,
+        "min_qty": 2,
+        "qty_mode": "UNIT",  # 單顆
+        "unit_label": "顆",
+    },
+    "scone": {
+        "label": "原味司康",
+        "unit_price": 65,
+        "has_flavor": False,
+        "flavors": [],
+        "min_qty": 1,
+        "qty_mode": "UNIT",
+        "unit_label": "顆",
+    },
+    "canele_box": {
+        "label": "可麗露（6顆/盒）",
+        "unit_price": 490,
+        "has_flavor": False,
+        "flavors": [],
+        "min_qty": 1,
+        "qty_mode": "BOX",   # 只能盒
+        "unit_label": "盒",
+    },
+    "toast": {
+        "label": "伊思尼奶酥厚片",
+        "unit_price": 85,
+        "has_flavor": True,
+        "flavors": TOAST_FLAVORS,
+        "min_qty": 1,
+        "qty_mode": "UNIT",
+        "unit_label": "片",
+    },
 }
 
 PICKUP_ADDRESS = "新竹縣竹北市隘口六街65號"
@@ -135,6 +163,62 @@ PICKUP_NOTICE = (
     f"{PICKUP_ADDRESS}\n\n"
     "提醒：所有甜點需提前3天預訂。"
 )
+
+
+# =========================
+# Safe send wrappers
+# =========================
+def safe_reply(messages, reply_token: str):
+    try:
+        messaging_api.reply_message(ReplyMessageRequest(replyToken=reply_token, messages=messages))
+    except Exception as e:
+        print("[ERROR] reply_message failed:", e)
+
+
+def safe_push(messages, to: str):
+    try:
+        messaging_api.push_message(PushMessageRequest(to=to, messages=messages))
+    except Exception as e:
+        print("[ERROR] push_message failed:", e)
+
+
+def reply_text(reply_token: str, text: str):
+    safe_reply([TextMessage(text=text)], reply_token)
+
+
+def push_text(user_id: str, text: str):
+    safe_push([TextMessage(text=text)], user_id)
+
+
+def reply_flex(reply_token: str, alt_text: str, flex_content: dict):
+    safe_reply([FlexMessage(altText=alt_text, contents=flex_content)], reply_token)
+
+
+def push_flex(user_id: str, alt_text: str, flex_content: dict):
+    safe_push([FlexMessage(altText=alt_text, contents=flex_content)], user_id)
+
+
+def _postback_action(label: str, data: str, display_text: Optional[str] = None) -> PostbackAction:
+    # ✅ displayText 只在有值時才帶，避免 LINE 400
+    if display_text:
+        return PostbackAction(label=label, data=data, displayText=display_text)
+    return PostbackAction(label=label, data=data)
+
+
+def reply_quickreply_postback(reply_token: str, text: str, buttons: List[dict]):
+    qr_items = []
+    for b in buttons:
+        qr_items.append(
+            QuickReplyItem(
+                action=_postback_action(
+                    label=b["label"],
+                    data=b["data"],
+                    display_text=b.get("displayText"),
+                )
+            )
+        )
+    qr = QuickReply(items=qr_items)
+    safe_reply([TextMessage(text=text, quickReply=qr)], reply_token)
 
 
 # =========================
@@ -180,8 +264,7 @@ def append_order_row(row: List[Any]) -> bool:
         return False
 
     try:
-        # ✅ 分頁名用單引號最穩（中文/空格都不怕）
-        range_ = f"'{SHEET_NAME}'!A1"
+        range_ = f"'{SHEET_NAME}'!A1"  # ✅ 最穩
         body = {"values": [row]}
         service.spreadsheets().values().append(
             spreadsheetId=GSHEET_ID,
@@ -232,80 +315,7 @@ def pretty_date_tw(yyyy_mm_dd: str) -> str:
 
 def date_candidates_3_to_14_days() -> List[str]:
     today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    dates = []
-    for i in range(3, 15):  # 3..14
-        dt = today + timedelta(days=i)
-        dates.append(dt.strftime("%Y-%m-%d"))
-    return dates
-
-
-def reply_text(reply_token: str, text: str):
-    messaging_api.reply_message(
-        ReplyMessageRequest(
-            replyToken=reply_token,
-            messages=[TextMessage(text=text)],
-        )
-    )
-
-
-def push_text(user_id: str, text: str):
-    messaging_api.push_message(
-        PushMessageRequest(
-            to=user_id,
-            messages=[TextMessage(text=text)],
-        )
-    )
-
-
-def reply_flex(reply_token: str, alt_text: str, flex_content: dict):
-    messaging_api.reply_message(
-        ReplyMessageRequest(
-            replyToken=reply_token,
-            messages=[FlexMessage(altText=alt_text, contents=flex_content)],
-        )
-    )
-
-
-def push_flex(user_id: str, alt_text: str, flex_content: dict):
-    messaging_api.push_message(
-        PushMessageRequest(
-            to=user_id,
-            messages=[FlexMessage(altText=alt_text, contents=flex_content)],
-        )
-    )
-
-
-def reply_quickreply_postback(reply_token: str, text: str, buttons: List[dict]):
-    """
-    buttons: [{"label": "...", "data": "..."}]
-    """
-    qr = QuickReply(
-        items=[
-            QuickReplyItem(action=PostbackAction(label=b["label"], data=b["data"], displayText=b.get("displayText")))
-            for b in buttons
-        ]
-    )
-    messaging_api.reply_message(
-        ReplyMessageRequest(
-            replyToken=reply_token,
-            messages=[TextMessage(text=text, quickReply=qr)],
-        )
-    )
-
-
-def push_quickreply_postback(user_id: str, text: str, buttons: List[dict]):
-    qr = QuickReply(
-        items=[
-            QuickReplyItem(action=PostbackAction(label=b["label"], data=b["data"], displayText=b.get("displayText")))
-            for b in buttons
-        ]
-    )
-    messaging_api.push_message(
-        PushMessageRequest(
-            to=user_id,
-            messages=[TextMessage(text=text, quickReply=qr)],
-        )
-    )
+    return [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(3, 15)]
 
 
 def reset_order_flow(sess: dict):
@@ -333,7 +343,7 @@ def add_to_cart(sess: dict, item_key: str, flavor: Optional[str], qty: int):
     if meta["has_flavor"] and not flavor:
         raise ValueError("請先選口味")
     if qty < meta["min_qty"]:
-        raise ValueError(f"此品項最少需 {meta['min_qty']} 個")
+        raise ValueError(f"此品項最少需 {meta['min_qty']} {meta['unit_label']}")
 
     unit = meta["unit_price"]
     subtotal = unit * qty
@@ -346,8 +356,16 @@ def add_to_cart(sess: dict, item_key: str, flavor: Optional[str], qty: int):
             "qty": qty,
             "unit_price": unit,
             "subtotal": subtotal,
+            "unit_label": meta["unit_label"],
         }
     )
+
+
+def _min_qty_for_cart_item(item: dict) -> int:
+    k = item.get("item_key")
+    if k in ITEMS:
+        return int(ITEMS[k]["min_qty"])
+    return 1
 
 
 def change_cart_qty(sess: dict, idx: int, delta: int) -> str:
@@ -356,26 +374,22 @@ def change_cart_qty(sess: dict, idx: int, delta: int) -> str:
         return "操作失敗：找不到該品項。"
 
     item = cart[idx]
-    item_key = item.get("item_key")
-    if item_key not in ITEMS:
-        return "操作失敗：品項資料不完整。"
-
-    min_qty = ITEMS[item_key]["min_qty"]
     old_qty = int(item.get("qty", 0))
     new_qty = old_qty + delta
 
-    # new_qty <=0 -> delete
+    min_qty = _min_qty_for_cart_item(item)
+    unit_label = item.get("unit_label", "個")
+
     if new_qty <= 0:
         removed = cart.pop(idx)
         name = removed.get("label", "")
         flavor = removed.get("flavor", "")
         return f"已刪除：{name}{('（'+flavor+'）') if flavor else ''}"
 
-    # below min_qty -> reject
     if new_qty < min_qty:
         name = item.get("label", "")
         flavor = item.get("flavor", "")
-        return f"不能再減了：{name}{('（'+flavor+'）') if flavor else ''} 最少需 {min_qty} 個。"
+        return f"不能再減了：{name}{('（'+flavor+'）') if flavor else ''} 最少需 {min_qty} {unit_label}。"
 
     unit = int(item.get("unit_price", 0))
     item["qty"] = new_qty
@@ -389,7 +403,8 @@ def cart_summary_lines(cart: List[dict]) -> str:
         name = x["label"]
         if x.get("flavor"):
             name += f"（{x['flavor']}）"
-        lines.append(f"- {name} x{x['qty']} = NT${x['subtotal']}")
+        unit_label = x.get("unit_label", "")
+        lines.append(f"- {name} x{x['qty']}{unit_label} = NT${x['subtotal']}")
     return "\n".join(lines)
 
 
@@ -397,40 +412,30 @@ def cart_summary_lines(cart: List[dict]) -> str:
 # Flex builders
 # =========================
 def build_dessert_menu_flex(mode: str = "BROWSE") -> dict:
-    """
-    mode:
-      - BROWSE: 甜點瀏覽卡（含「我要下單」按鈕）
-      - ORDER: 進入下單卡（商品可直接點）
-    """
     title = "請選擇商品" if mode == "ORDER" else "甜點菜單"
     subtitle = "（全部甜點需提前 3 天預訂）"
 
     def item_btn(label: str, data: str) -> dict:
-        return {
-            "type": "button",
-            "style": "primary",
-            "action": {"type": "postback", "label": label, "data": data},
-        }
+        return {"type": "button", "style": "primary", "action": {"type": "postback", "label": label, "data": data}}
 
-    contents = [
+    body_contents = [
         {"type": "text", "text": title, "weight": "bold", "size": "xl"},
         {"type": "text", "text": subtitle, "size": "sm", "color": "#666666"},
-        item_btn("達克瓦茲｜NT$95", "ITEM:dacquoise"),
-        item_btn("原味司康｜NT$65", "ITEM:scone"),
-        item_btn("原味可麗露｜NT$90", "ITEM:canele"),
-        item_btn("伊思尼奶酥厚片｜NT$85", "ITEM:toast"),
+        item_btn("達克瓦茲｜NT$95/顆", "ITEM:dacquoise"),
+        item_btn("原味司康｜NT$65/顆", "ITEM:scone"),
+        item_btn("可麗露（6顆/盒）｜NT$490/盒", "ITEM:canele_box"),
+        item_btn("伊思尼奶酥厚片｜NT$85/片", "ITEM:toast"),
         {"type": "separator", "margin": "lg"},
     ]
 
-    footer_btns = []
     if mode == "BROWSE":
-        footer_btns = [
+        footer_contents = [
             {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🧾 我要下單", "data": "CMD:START_ORDER"}},
             {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "📌 取貨說明", "data": "CMD:INFO_PICKUP"}},
             {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "💰 付款說明", "data": "CMD:INFO_PAY"}},
         ]
     else:
-        footer_btns = [
+        footer_contents = [
             {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "🧾 前往結帳", "data": "CMD:CHECKOUT"}},
             {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "🛠 修改內容", "data": "CMD:EDIT_CART"}},
             {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "🗑 清空重來", "data": "CMD:RESET"}},
@@ -439,8 +444,8 @@ def build_dessert_menu_flex(mode: str = "BROWSE") -> dict:
     return {
         "type": "bubble",
         "size": "mega",
-        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": contents},
-        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": footer_btns},
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": body_contents},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": footer_contents},
     }
 
 
@@ -454,25 +459,14 @@ def build_pickup_method_flex() -> dict:
             "contents": [
                 {"type": "text", "text": "請選擇店取或宅配", "weight": "bold", "size": "xl"},
                 {"type": "text", "text": "日期可選 3～14 天內", "size": "sm", "color": "#666666"},
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "action": {"type": "postback", "label": "🏪 店取", "data": "PICKUP:STORE"},
-                },
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "action": {"type": "postback", "label": "🚚 冷凍宅配", "data": "PICKUP:DELIVERY"},
-                },
+                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🏪 店取", "data": "PICKUP:STORE"}},
+                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🚚 冷凍宅配", "data": "PICKUP:DELIVERY"}},
             ],
         },
     }
 
 
 def build_cart_lines_contents(cart: List[dict]) -> List[dict]:
-    """
-    用於「結帳確認卡」顯示清單
-    """
     contents: List[dict] = []
     if not cart:
         return [{"type": "text", "text": "（購物車目前是空的）", "size": "sm", "color": "#666666"}]
@@ -482,6 +476,7 @@ def build_cart_lines_contents(cart: List[dict]) -> List[dict]:
         name = x.get("label", "")
         flavor = x.get("flavor", "")
         qty = int(x.get("qty", 0))
+        unit_label = x.get("unit_label", "")
         subtotal = int(x.get("subtotal", 0))
 
         title = f"{idx}. {name}" + (f"（{flavor}）" if flavor else "")
@@ -491,7 +486,7 @@ def build_cart_lines_contents(cart: List[dict]) -> List[dict]:
                 "type": "box",
                 "layout": "baseline",
                 "contents": [
-                    {"type": "text", "text": f"x{qty}", "size": "sm", "color": "#666666", "flex": 0},
+                    {"type": "text", "text": f"x{qty}{unit_label}", "size": "sm", "color": "#666666", "flex": 0},
                     {"type": "text", "text": f"NT${subtotal}", "size": "sm", "align": "end", "flex": 1},
                 ],
             }
@@ -585,66 +580,114 @@ def build_confirm_card_delivery(sess: dict) -> dict:
     }
 
 
-def build_cart_edit_flex(sess: dict) -> dict:
+def build_cart_edit_carousel(sess: dict) -> dict:
     cart = sess.get("cart", [])
-    total = cart_total(cart)
-
-    contents: List[dict] = [
-        {"type": "text", "text": "🛠 修改結帳內容", "weight": "bold", "size": "xl"},
-        {"type": "text", "text": "可直接加減數量（達克瓦茲最少 2 個）。", "size": "sm", "color": "#666666", "wrap": True},
-        {"type": "separator", "margin": "md"},
-    ]
-
     if not cart:
-        contents.append({"type": "text", "text": "購物車目前是空的。", "size": "sm", "color": "#666666"})
-    else:
-        for idx, x in enumerate(cart):
-            name = x.get("label", "")
-            flavor = x.get("flavor", "")
-            qty = int(x.get("qty", 0))
-            subtotal = int(x.get("subtotal", 0))
-
-            title = f"{name}" + (f"（{flavor}）" if flavor else "")
-            contents.append({"type": "text", "text": title, "weight": "bold", "size": "md", "wrap": True})
-            contents.append({
+        # 空車就給一張 bubble
+        bubble = {
+            "type": "bubble",
+            "body": {
                 "type": "box",
-                "layout": "baseline",
+                "layout": "vertical",
+                "spacing": "md",
                 "contents": [
-                    {"type": "text", "text": f"數量：{qty}", "size": "sm", "color": "#666666", "flex": 0},
-                    {"type": "text", "text": f"NT${subtotal}", "size": "sm", "align": "end", "flex": 1},
+                    {"type": "text", "text": "🛠 修改結帳內容", "weight": "bold", "size": "xl"},
+                    {"type": "text", "text": "購物車目前是空的。", "size": "sm", "color": "#666666"},
                 ],
-            })
-
-            contents.append({
+            },
+            "footer": {
                 "type": "box",
-                "layout": "horizontal",
+                "layout": "vertical",
                 "spacing": "sm",
                 "contents": [
-                    {"type": "button", "style": "secondary", "height": "sm", "action": {"type": "postback", "label": "➖", "data": f"QTY:-1:{idx}"}, "flex": 1},
-                    {"type": "button", "style": "secondary", "height": "sm", "action": {"type": "postback", "label": "➕", "data": f"QTY:+1:{idx}"}, "flex": 1},
-                    {"type": "button", "style": "secondary", "height": "sm", "action": {"type": "postback", "label": "🗑", "data": f"DEL:{idx}"}, "flex": 1},
+                    {"type": "button", "style": "primary", "action": {"type": "postback", "label": "➕ 繼續加購", "data": "CMD:START_ORDER"}},
+                    {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "返回結帳", "data": "CMD:BACK_TO_CONFIRM"}},
                 ],
-            })
+            },
+        }
+        return {"type": "carousel", "contents": [bubble]}
 
-            contents.append({"type": "separator", "margin": "md"})
+    bubbles = []
+    show = cart[:MAX_EDIT_CAROUSEL]
+    for idx, x in enumerate(show):
+        name = x.get("label", "")
+        flavor = x.get("flavor", "")
+        qty = int(x.get("qty", 0))
+        unit_label = x.get("unit_label", "")
+        unit_price = int(x.get("unit_price", 0))
+        subtotal = int(x.get("subtotal", 0))
 
-        contents.append({"type": "text", "text": f"目前小計：NT${total}", "weight": "bold", "size": "lg"})
+        title = name + (f"（{flavor}）" if flavor else "")
+        hint = "左右滑動可修改不同品項" if idx == 0 else ""
 
-    return {
-        "type": "bubble",
-        "size": "mega",
-        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": contents},
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "sm",
-            "contents": [
-                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "返回結帳確認", "data": "CMD:BACK_TO_CONFIRM"}},
-                {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "清空購物車", "data": "CMD:RESET"}},
-                {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "➕ 繼續加購", "data": "CMD:START_ORDER"}},
-            ],
-        },
-    }
+        bubble = {
+            "type": "bubble",
+            "size": "mega",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "md",
+                "contents": [
+                    {"type": "text", "text": "🛠 修改結帳內容", "weight": "bold", "size": "xl"},
+                    {"type": "text", "text": hint, "size": "sm", "color": "#666666", "wrap": True} if hint else {"type": "spacer", "size": "xs"},
+                    {"type": "separator", "margin": "md"},
+                    {"type": "text", "text": title, "weight": "bold", "size": "lg", "wrap": True},
+                    {"type": "text", "text": f"單價：NT${unit_price} / {unit_label}", "size": "sm", "color": "#666666", "wrap": True},
+                    {"type": "text", "text": f"數量：{qty}{unit_label}", "size": "md", "wrap": True},
+                    {"type": "text", "text": f"小計：NT${subtotal}", "weight": "bold", "size": "lg"},
+                ],
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    {
+                        "type": "box",
+                        "layout": "horizontal",
+                        "spacing": "sm",
+                        "contents": [
+                            {"type": "button", "style": "secondary", "height": "sm",
+                             "action": {"type": "postback", "label": "➖ 減少數量", "data": f"QTY:-1:{idx}"},
+                             "flex": 1},
+                            {"type": "button", "style": "secondary", "height": "sm",
+                             "action": {"type": "postback", "label": "➕ 增加數量", "data": f"QTY:+1:{idx}"},
+                             "flex": 1},
+                        ],
+                    },
+                    {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "🗑 刪除品項", "data": f"DEL:{idx}"}},
+                    {"type": "button", "style": "primary", "action": {"type": "postback", "label": "返回結帳確認", "data": "CMD:BACK_TO_CONFIRM"}},
+                ],
+            },
+        }
+        bubbles.append(bubble)
+
+    if len(cart) > MAX_EDIT_CAROUSEL:
+        bubbles.append(
+            {
+                "type": "bubble",
+                "body": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "md",
+                    "contents": [
+                        {"type": "text", "text": "🧾 品項太多了", "weight": "bold", "size": "xl"},
+                        {"type": "text", "text": f"目前只顯示前 {MAX_EDIT_CAROUSEL} 筆。\n如需調整其他品項，請先刪減到 10 筆內。", "wrap": True, "size": "sm", "color": "#666666"},
+                    ],
+                },
+                "footer": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "sm",
+                    "contents": [
+                        {"type": "button", "style": "primary", "action": {"type": "postback", "label": "返回結帳確認", "data": "CMD:BACK_TO_CONFIRM"}},
+                        {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "清空重來", "data": "CMD:RESET"}},
+                    ],
+                },
+            }
+        )
+
+    return {"type": "carousel", "contents": bubbles}
 
 
 # =========================
@@ -665,7 +708,6 @@ def create_order_and_write_sheet(user_id: str) -> str:
 
     note = ""
     if pickup_method == "宅配":
-        # 希望到貨日期（delivery_date）
         pickup_date = sess.get("delivery_date") or ""
         pickup_time = ""
         note = f"希望到貨:{pickup_date} | 收件人:{sess.get('delivery_name','')} | 電話:{sess.get('delivery_phone','')} | 地址:{sess.get('delivery_address','')}"
@@ -675,7 +717,7 @@ def create_order_and_write_sheet(user_id: str) -> str:
     row = [
         now_str(),
         user_id,
-        "",  # display_name 先留空（你要抓 profile 我也可加）
+        "",
         order_id,
         json.dumps({"cart": cart}, ensure_ascii=False),
         pickup_method,
@@ -728,20 +770,17 @@ def handle_text(event: MessageEvent):
     text = event.message.text.strip()
     sess = get_session(user_id)
 
-    # 基本指令
     if text in ["清空", "清空重來", "reset"]:
         reset_order_flow(sess)
         reply_text(event.reply_token, "已清空。輸入「甜點」看菜單，或輸入「我要下單」開始下單。")
         return
 
     if text == "甜點":
-        # 只顯示菜單（瀏覽）
         reply_flex(event.reply_token, "甜點菜單", build_dessert_menu_flex(mode="BROWSE"))
         sess["state"] = "IDLE"
         return
 
     if text in ["我要下單", "下單", "開始下單"]:
-        # 進入下單
         sess["state"] = "ORDERING"
         reply_flex(event.reply_token, "開始下單", build_dessert_menu_flex(mode="ORDER"))
         return
@@ -754,10 +793,9 @@ def handle_text(event: MessageEvent):
         reply_text(event.reply_token, BANK_TRANSFER_TEXT)
         return
 
-    # 依 state 收資料（姓名/電話/地址）
+    # 店取姓名
     if sess["state"] == "WAIT_PICKUP_NAME":
         sess["pickup_name"] = text
-        sess["state"] = "CONFIRM_DONE"
         order_id = create_order_and_write_sheet(user_id)
 
         summary = cart_summary_lines(sess["cart"])
@@ -775,11 +813,10 @@ def handle_text(event: MessageEvent):
             f"地址：{PICKUP_ADDRESS}\n\n"
             + BANK_TRANSFER_TEXT
         )
-
-        # 完成後清空購物車
         reset_order_flow(sess)
         return
 
+    # 宅配資料
     if sess["state"] == "WAIT_DELIVERY_NAME":
         sess["delivery_name"] = text
         sess["state"] = "WAIT_DELIVERY_PHONE"
@@ -794,7 +831,6 @@ def handle_text(event: MessageEvent):
 
     if sess["state"] == "WAIT_DELIVERY_ADDRESS":
         sess["delivery_address"] = text
-        sess["state"] = "CONFIRM_DONE"
         order_id = create_order_and_write_sheet(user_id)
 
         total = cart_total(sess["cart"])
@@ -817,16 +853,13 @@ def handle_text(event: MessageEvent):
             + "\n\n"
             + BANK_TRANSFER_TEXT
         )
-
         reset_order_flow(sess)
         return
 
-    # 轉帳回覆
     if text.startswith("已轉帳"):
         reply_text(event.reply_token, "收到，我們會核對帳款後依訂單號安排出貨。若需補充資訊可直接留言。")
         return
 
-    # fallback
     reply_text(event.reply_token, "請輸入「甜點」看菜單，或輸入「我要下單」開始下單。")
 
 
@@ -856,12 +889,12 @@ def handle_postback(event: PostbackEvent):
         reply_flex(rt, "開始下單", build_dessert_menu_flex(mode="ORDER"))
         return
 
-    # 下單未開始，禁止點商品
+    # 未開始下單，不允許點商品
     if data.startswith("ITEM:") and sess.get("state") != "ORDERING":
         reply_text(rt, "要先按「我要下單」才會開始選購喔。")
         return
 
-    # 商品選擇
+    # 商品
     if data.startswith("ITEM:"):
         item_key = data.split(":", 1)[1]
         if item_key not in ITEMS:
@@ -873,15 +906,15 @@ def handle_postback(event: PostbackEvent):
 
         meta = ITEMS[item_key]
         if meta["has_flavor"]:
-            # 口味 quick reply（postback，不會送出文字）
             buttons = [{"label": f, "data": f"FLAVOR:{f}"} for f in meta["flavors"]]
             reply_quickreply_postback(rt, f"你選了：{meta['label']}\n請選口味：", buttons)
             sess["state"] = "WAIT_FLAVOR"
         else:
-            # 直接選數量
+            # ✅ 可麗露（盒）也走這裡：數量=盒數
             min_qty = meta["min_qty"]
-            qty_buttons = [{"label": str(i), "data": f"QTY:{i}"} for i in range(min_qty, 13)]
-            reply_quickreply_postback(rt, f"你選了：{meta['label']}\n請選數量（最少 {min_qty}）：", qty_buttons)
+            unit_label = meta["unit_label"]
+            qty_buttons = [{"label": f"{i}{unit_label}", "data": f"QTY:{i}"} for i in range(min_qty, 11)]
+            reply_quickreply_postback(rt, f"你選了：{meta['label']}\n請選數量（最少 {min_qty}{unit_label}）：", qty_buttons)
             sess["state"] = "WAIT_QTY"
         return
 
@@ -898,17 +931,18 @@ def handle_postback(event: PostbackEvent):
             return
 
         sess["pending_flavor"] = flavor
-        min_qty = ITEMS[item_key]["min_qty"]
-        qty_buttons = [{"label": str(i), "data": f"QTY:{i}"} for i in range(min_qty, 13)]
-        reply_quickreply_postback(rt, f"已選口味：{flavor}\n請選數量（最少 {min_qty}）：", qty_buttons)
+        meta = ITEMS[item_key]
+        min_qty = meta["min_qty"]
+        unit_label = meta["unit_label"]
+        qty_buttons = [{"label": f"{i}{unit_label}", "data": f"QTY:{i}"} for i in range(min_qty, 13)]
+        reply_quickreply_postback(rt, f"已選口味：{flavor}\n請選數量（最少 {min_qty}{unit_label}）：", qty_buttons)
         sess["state"] = "WAIT_QTY"
         return
 
-    # 數量（加入購物車）
+    # 數量 -> 加入購物車
     if data.startswith("QTY:") and sess.get("state") == "WAIT_QTY":
-        qty_raw = data.split(":", 1)[1]
         try:
-            qty = int(qty_raw)
+            qty = int(data.split(":", 1)[1])
         except Exception:
             reply_text(rt, "數量格式錯誤，請重新選擇。")
             return
@@ -925,19 +959,16 @@ def handle_postback(event: PostbackEvent):
             reply_text(rt, f"加入失敗：{e}")
             return
 
-        # 清 pending
         sess["pending_item"] = None
         sess["pending_flavor"] = None
         sess["state"] = "ORDERING"
 
         total = cart_total(sess["cart"])
         reply_text(rt, f"✅ 已加入購物車\n目前小計：NT${total}")
-
-        # 下一步（用 push，避免 reply token 壓力）
         push_flex(user_id, "下單中", build_dessert_menu_flex(mode="ORDER"))
         return
 
-    # 前往結帳
+    # 結帳
     if data == "CMD:CHECKOUT":
         if not sess["cart"]:
             reply_text(rt, "購物車是空的，先加入商品喔。")
@@ -949,19 +980,14 @@ def handle_postback(event: PostbackEvent):
     # 取貨方式
     if data == "PICKUP:STORE":
         sess["pickup_method"] = "店取"
-        # 日期按鈕
-        buttons = []
-        for d in date_candidates_3_to_14_days():
-            buttons.append({"label": pretty_date_tw(d), "data": f"DATE_PICKUP:{d}"})
+        buttons = [{"label": pretty_date_tw(d), "data": f"DATE_PICKUP:{d}"} for d in date_candidates_3_to_14_days()]
         reply_quickreply_postback(rt, "🌿 店取日期（3～14天內）\n請點選日期：", buttons)
         sess["state"] = "WAIT_PICKUP_DATE"
         return
 
     if data == "PICKUP:DELIVERY":
         sess["pickup_method"] = "宅配"
-        buttons = []
-        for d in date_candidates_3_to_14_days():
-            buttons.append({"label": pretty_date_tw(d), "data": f"DATE_DELIVERY:{d}"})
+        buttons = [{"label": pretty_date_tw(d), "data": f"DATE_DELIVERY:{d}"} for d in date_candidates_3_to_14_days()]
         reply_quickreply_postback(rt, "🚚 宅配希望到貨日（3～14天內）\n請點選日期：", buttons)
         sess["state"] = "WAIT_DELIVERY_DATE"
         return
@@ -970,7 +996,6 @@ def handle_postback(event: PostbackEvent):
     if data.startswith("DATE_PICKUP:"):
         d = data.split(":", 1)[1]
         sess["pickup_date"] = d
-        # 時段按鈕
         buttons = [
             {"label": "10:00-12:00", "data": "TIME:10:00-12:00"},
             {"label": "12:00-14:00", "data": "TIME:12:00-14:00"},
@@ -984,9 +1009,7 @@ def handle_postback(event: PostbackEvent):
     if data.startswith("TIME:") and sess.get("state") == "WAIT_PICKUP_TIME":
         t = data.split(":", 1)[1]
         sess["pickup_time"] = t
-        # 顯示確認卡（含清單、小計、修改按鈕）
         reply_flex(rt, "店取確認", build_confirm_card_pickup(sess))
-        sess["state"] = "WAIT_PICKUP_NAME_READY"
         return
 
     # 宅配日期
@@ -994,17 +1017,15 @@ def handle_postback(event: PostbackEvent):
         d = data.split(":", 1)[1]
         sess["delivery_date"] = d
         reply_flex(rt, "宅配確認", build_confirm_card_delivery(sess))
-        sess["state"] = "WAIT_DELIVERY_NAME_READY"
         return
 
-    # 修改內容
+    # 修改內容（Carousel）
     if data == "CMD:EDIT_CART":
-        reply_flex(rt, "修改結帳內容", build_cart_edit_flex(sess))
+        reply_flex(rt, "修改結帳內容", build_cart_edit_carousel(sess))
         return
 
-    # QTY:+1 / QTY:-1 (修改卡內)
+    # QTY:+1 / QTY:-1（Carousel）
     if data.startswith("QTY:") and sess.get("state") != "WAIT_QTY":
-        # 格式：QTY:+1:idx 或 QTY:-1:idx
         try:
             _, delta_raw, idx_raw = data.split(":")
             delta = 1 if delta_raw == "+1" else -1
@@ -1015,10 +1036,10 @@ def handle_postback(event: PostbackEvent):
 
         msg = change_cart_qty(sess, idx, delta)
         reply_text(rt, msg)
-        push_flex(user_id, "修改結帳內容", build_cart_edit_flex(sess))
+        push_flex(user_id, "修改結帳內容", build_cart_edit_carousel(sess))
         return
 
-    # 刪除某筆
+    # 刪除
     if data.startswith("DEL:"):
         try:
             idx = int(data.split(":", 1)[1])
@@ -1033,10 +1054,10 @@ def handle_postback(event: PostbackEvent):
         except Exception:
             reply_text(rt, "刪除失敗：格式錯誤。")
 
-        push_flex(user_id, "修改結帳內容", build_cart_edit_flex(sess))
+        push_flex(user_id, "修改結帳內容", build_cart_edit_carousel(sess))
         return
 
-    # 返回確認卡
+    # 回確認卡
     if data == "CMD:BACK_TO_CONFIRM":
         if sess.get("pickup_method") == "店取" and sess.get("pickup_date") and sess.get("pickup_time"):
             reply_flex(rt, "店取確認", build_confirm_card_pickup(sess))
@@ -1046,17 +1067,15 @@ def handle_postback(event: PostbackEvent):
             reply_text(rt, "尚未完成結帳資訊，請先前往結帳。")
         return
 
-    # 問取件人姓名
+    # 問姓名
     if data == "CMD:ASK_PICKUP_NAME":
         sess["state"] = "WAIT_PICKUP_NAME"
         reply_text(rt, "請輸入店取取件人姓名：")
         return
 
-    # 問宅配姓名（接著電話、地址）
     if data == "CMD:ASK_DELIVERY_NAME":
         sess["state"] = "WAIT_DELIVERY_NAME"
         reply_text(rt, "請輸入宅配收件人姓名：")
         return
 
-    # fallback
     reply_text(rt, "我沒看懂你的操作，請輸入「甜點」或「我要下單」。")
