@@ -505,6 +505,28 @@ def on_message(event: MessageEvent):
     user_id = event.source.user_id
     text = (event.message.text or "").strip()
     st = get_user_state(user_id)
+        # === Rich Menu 若是「送文字」，就走這裡（文字=按鈕）===
+    if text in ["選單", "menu", "開始", "嗨", "hi", "你好"]:
+        reply_flex(event.reply_token, "選單", build_main_menu_flex())
+        return
+
+    if text in ["我要下單", "下單", "開始下單"]:
+        reset_order(user_id)
+        reply_text(event.reply_token, "好的，開始下單。先選商品（可多次加購）：")
+        reply_flex(event.reply_token, "選商品", build_item_picker_flex())
+        return
+
+    if text in ["取貨說明", "取貨", "宅配說明", "店取說明"]:
+        reply_text(event.reply_token, build_pickup_info_text())
+        return
+
+    if text in ["付款說明", "付款", "匯款說明", "轉帳說明"]:
+        reply_text(event.reply_token, build_payment_info_text())
+        return
+
+    if text in ["甜點", "甜點菜單", "菜單"]:
+        reply_flex(event.reply_token, "選商品", build_item_picker_flex())
+        return
 
     # 入口
     if text in ["選單", "menu", "開始", "嗨", "hi", "你好"]:
