@@ -1,10 +1,3 @@
-# main.py — 整合版（甜點=只看菜單 / 我要下單=開始下單 / 全部按鈕不顯示程式碼）
-# 重點：
-# 1) 所有按鈕一律用 postback（聊天室不會出現 ITEM: / FLAVOR: / QTY:）
-# 2) 「甜點」只顯示菜單預覽（不能點品項），「我要下單」才開啟可點選的下單選單
-# 3) Flex dict 一律轉 FlexContainer，避免 LINE 400：At least one block must be specified
-# 4) reply_token 只用一次（一次回覆多則訊息）
-
 import os
 import json
 import base64
@@ -30,10 +23,10 @@ from linebot.v3.messaging import (
     FlexMessage,
     QuickReply,
     QuickReplyItem,
-    MessageAction,
     PostbackAction,
+    DatetimePickerAction,
 )
-from linebot.v3.messaging import DatetimePickerAction
+
 from linebot.v3.messaging.models import FlexContainer
 
 from google.oauth2 import service_account
@@ -202,36 +195,6 @@ def append_order_row(row: List[Any]) -> bool:
 # =========================
 # Helpers
 # =========================
-def push_date_picker(user_id: str, title_text: str, data_tag: str):
-    """
-    data_tag: 用來分辨是店取日期還是宅配日期，例如 "DATE:PICKUP" / "DATE:DELIVERY"
-    """
-    today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    min_d = (today + timedelta(days=3)).strftime("%Y-%m-%d")
-    max_d = (today + timedelta(days=14)).strftime("%Y-%m-%d")
-    initial = min_d
-
-    qr = QuickReply(
-        items=[
-            QuickReplyItem(
-                action=DatetimePickerAction(
-                    label="📅 選擇日期",
-                    data=data_tag,
-                    mode="date",
-                    initial=initial,
-                    min=min_d,
-                    max=max_d,
-                )
-            )
-        ]
-    )
-
-    messaging_api.push_message(
-        PushMessageRequest(
-            to=user_id,
-            messages=[TextMessage(text=title_text, quickReply=qr)],
-        )
-    )
 def now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -250,114 +213,16 @@ def shipping_fee(total: int) -> int:
     return 0 if total >= 2500 else 180
 
 
-def parse_date_yyyy_mm_dd(s: str) -> Optional[datetime]:
-    try:
-        dt = datetime.strptime(s.strip(), "%Y-%m-%d")
-        return dt.replace(tzinfo=TZ)
-    except Exception:
-        return None
-
-
-def date_in_range_3_to_14_days(dt: datetime) -> bool:
-    today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    min_d = today + timedelta(days=3)
-    max_d = today + timedelta(days=14)
-    target = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    return min_d <= target <= max_d
-
 def pretty_date_tw(yyyy_mm_dd: str) -> str:
     # 2026-01-10 -> 1/10（六）
     try:
         dt = datetime.strptime(yyyy_mm_dd, "%Y-%m-%d")
-        week = "一二三四五六日"[dt.weekday()]  # Mon=0
+        week = "一二三四五六日"[dt.weekday()]
         return f"{dt.month}/{dt.day}（{week}）"
     except Exception:
         return yyyy_mm_dd
 
-def build_confirm_card_pickup(sess: dict) -> dict:
-    total = cart_total(sess.get("cart", []))
-    date_text = pretty_date_tw(sess.get("pickup_date") or "")
-    time_text = sess.get("pickup_time") or ""
 
-    return {
-        "type": "bubble",
-        "size": "mega",
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "md",
-            "contents": [
-                {"type": "text", "text": "✅ 店取資訊已選好", "weight": "bold", "size": "xl"},
-                {"type": "text", "text": f"📅 日期：{date_text}", "wrap": True, "size": "md"},
-                {"type": "text", "text": f"🕒 時段：{time_text}", "wrap": True, "size": "md"},
-                {"type": "text", "text": f"📍 地址：{PICKUP_ADDRESS}", "wrap": True, "size": "sm", "color": "#666666"},
-                {"type": "separator", "margin": "lg"},
-                {"type": "text", "text": f"🧾 目前小計：NT${total}", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "下一步請填取件人姓名，或返回加購。", "size": "sm", "color": "#666666", "wrap": True},
-            ],
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "sm",
-            "contents": [
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "action": {"type": "postback", "label": "✍️ 填取件人姓名", "data": "CMD:ASK_PICKUP_NAME"},
-                },
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "action": {"type": "postback", "label": "➕ 繼續加購", "data": "CMD:START_ORDER"},
-                },
-            ],
-        },
-    }
-
-
-def build_confirm_card_delivery(sess: dict) -> dict:
-    total = cart_total(sess.get("cart", []))
-    fee = shipping_fee(total)
-    grand = total + fee
-    date_text = pretty_date_tw(sess.get("delivery_date") or "")
-
-    return {
-        "type": "bubble",
-        "size": "mega",
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "md",
-            "contents": [
-                {"type": "text", "text": "✅ 宅配日期已選好", "weight": "bold", "size": "xl"},
-                {"type": "text", "text": f"📅 希望到貨：{date_text}", "wrap": True, "size": "md"},
-                {"type": "text", "text": "（僅希望日，不保證準時到貨）", "wrap": True, "size": "sm", "color": "#666666"},
-                {"type": "separator", "margin": "lg"},
-                {"type": "text", "text": f"🧾 小計：NT${total}", "size": "md", "wrap": True},
-                {"type": "text", "text": f"🚚 運費：NT${fee}（滿2500免運）", "size": "md", "wrap": True},
-                {"type": "text", "text": f"💰 應付總額：NT${grand}", "weight": "bold", "size": "lg", "wrap": True},
-                {"type": "text", "text": "下一步請填收件人姓名，或返回加購。", "size": "sm", "color": "#666666", "wrap": True},
-            ],
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "sm",
-            "contents": [
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "action": {"type": "postback", "label": "✍️ 填收件人姓名", "data": "CMD:ASK_DELIVERY_NAME"},
-                },
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "action": {"type": "postback", "label": "➕ 繼續加購", "data": "CMD:START_ORDER"},
-                },
-            ],
-        },
-    }
 # =========================
 # LINE send helpers
 # =========================
@@ -426,6 +291,38 @@ def push_quick_reply_postback(user_id: str, text: str, items: List[dict]):
         PushMessageRequest(
             to=user_id,
             messages=[TextMessage(text=text, quickReply=QuickReply(items=qr_items))],
+        )
+    )
+
+
+def push_date_picker(user_id: str, title_text: str, data_tag: str):
+    """
+    data_tag: "DATE:PICKUP" / "DATE:DELIVERY"
+    """
+    today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    min_d = (today + timedelta(days=3)).strftime("%Y-%m-%d")
+    max_d = (today + timedelta(days=14)).strftime("%Y-%m-%d")
+    initial = min_d
+
+    qr = QuickReply(
+        items=[
+            QuickReplyItem(
+                action=DatetimePickerAction(
+                    label="📅 選擇日期",
+                    data=data_tag,
+                    mode="date",
+                    initial=initial,
+                    min=min_d,
+                    max=max_d,
+                )
+            )
+        ]
+    )
+
+    messaging_api.push_message(
+        PushMessageRequest(
+            to=user_id,
+            messages=[TextMessage(text=title_text, quickReply=qr)],
         )
     )
 
@@ -500,6 +397,76 @@ def build_pickup_method_flex() -> dict:
                 {"type": "text", "text": "請選擇店取或宅配", "size": "sm", "color": "#666666"},
                 {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🏪 店取", "data": "取貨:店取"}},
                 {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🚚 冷凍宅配", "data": "取貨:宅配"}},
+            ],
+        },
+    }
+
+
+def build_confirm_card_pickup(sess: dict) -> dict:
+    total = cart_total(sess.get("cart", []))
+    date_text = pretty_date_tw(sess.get("pickup_date") or "")
+    time_text = sess.get("pickup_time") or ""
+
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": "✅ 店取資訊已選好", "weight": "bold", "size": "xl"},
+                {"type": "text", "text": f"📅 日期：{date_text}", "wrap": True, "size": "md"},
+                {"type": "text", "text": f"🕒 時段：{time_text}", "wrap": True, "size": "md"},
+                {"type": "text", "text": f"📍 地址：{PICKUP_ADDRESS}", "wrap": True, "size": "sm", "color": "#666666"},
+                {"type": "separator", "margin": "lg"},
+                {"type": "text", "text": f"🧾 目前小計：NT${total}", "weight": "bold", "size": "lg"},
+                {"type": "text", "text": "下一步請填取件人姓名，或返回加購。", "size": "sm", "color": "#666666", "wrap": True},
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "✍️ 填取件人姓名", "data": "CMD:ASK_PICKUP_NAME"}},
+                {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "➕ 繼續加購", "data": "CMD:START_ORDER"}},
+            ],
+        },
+    }
+
+
+def build_confirm_card_delivery(sess: dict) -> dict:
+    total = cart_total(sess.get("cart", []))
+    fee = shipping_fee(total)
+    grand = total + fee
+    date_text = pretty_date_tw(sess.get("delivery_date") or "")
+
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": "✅ 宅配日期已選好", "weight": "bold", "size": "xl"},
+                {"type": "text", "text": f"📅 希望到貨：{date_text}", "wrap": True, "size": "md"},
+                {"type": "text", "text": "（僅希望日，不保證準時到貨）", "wrap": True, "size": "sm", "color": "#666666"},
+                {"type": "separator", "margin": "lg"},
+                {"type": "text", "text": f"🧾 小計：NT${total}", "size": "md", "wrap": True},
+                {"type": "text", "text": f"🚚 運費：NT${fee}（滿2500免運）", "size": "md", "wrap": True},
+                {"type": "text", "text": f"💰 應付總額：NT${grand}", "weight": "bold", "size": "lg", "wrap": True},
+                {"type": "text", "text": "下一步請填收件人姓名，或返回加購。", "size": "sm", "color": "#666666", "wrap": True},
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "✍️ 填收件人姓名", "data": "CMD:ASK_DELIVERY_NAME"}},
+                {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "➕ 繼續加購", "data": "CMD:START_ORDER"}},
             ],
         },
     }
@@ -667,18 +634,15 @@ def handle_message(event: MessageEvent):
 
     display_name = "LINE用戶"
 
-    # 清空
     if text in ["清空重來", "清空", "reset"]:
         reset_session(user_id)
         reply_text(event.reply_token, "已清空。輸入「甜點」看菜單，或輸入「我要下單」開始。")
         return
 
-    # 甜點：只看菜單（不能點品項）
     if text == "甜點":
         show_menu_preview(user_id, reply_token=event.reply_token)
         return
 
-    # 我要下單：開始下單（可點品項）
     if text in ["我要下單", "下訂單", "開始下單"]:
         sess["state"] = "ORDERING"
         show_order_menu(user_id, reply_token=event.reply_token)
@@ -692,39 +656,11 @@ def handle_message(event: MessageEvent):
         reply_text(event.reply_token, BANK_TRANSFER_TEXT)
         return
 
-    # 日期輸入（店取/宅配）
-    if sess["state"] in ["WAIT_PICKUP_DATE", "WAIT_DELIVERY_DATE"]:
-        dt = parse_date_yyyy_mm_dd(text)
-        if not dt:
-            reply_text(event.reply_token, "日期格式請用 YYYY-MM-DD，例如 2026-01-15")
-            return
+    if text.startswith("已轉帳"):
+        reply_text(event.reply_token, "收到，我們會核對帳款後依訂單號安排出貨。若需補充資訊也可在此留言。")
+        return
 
-        if not date_in_range_3_to_14_days(dt):
-            reply_text(event.reply_token, "日期需在 3～14 天內，請重新輸入 YYYY-MM-DD")
-            return
-
-        if sess["state"] == "WAIT_PICKUP_DATE":
-            sess["pickup_date"] = dt.strftime("%Y-%m-%d")
-            sess["state"] = "WAIT_PICKUP_TIME"
-            push_quick_reply_postback(
-                user_id,
-                "請選店取時段：",
-                [
-                    {"label": "10:00-12:00", "data": "時段:10:00-12:00"},
-                    {"label": "12:00-14:00", "data": "時段:12:00-14:00"},
-                    {"label": "14:00-16:00", "data": "時段:14:00-16:00"},
-                ],
-            )
-            reply_text(event.reply_token, "已收到取貨日期，請選時段（下方按鈕）。")
-            return
-
-        if sess["state"] == "WAIT_DELIVERY_DATE":
-            sess["delivery_date"] = dt.strftime("%Y-%m-%d")
-            sess["state"] = "WAIT_DELIVERY_NAME"
-            reply_text(event.reply_token, "請輸入宅配收件人姓名：")
-            return
-
-    # 店取取件人姓名
+    # 店取/宅配姓名/電話/地址（這些仍需輸入）
     if sess["state"] == "WAIT_PICKUP_NAME":
         sess["pickup_name"] = text
 
@@ -745,7 +681,6 @@ def handle_message(event: MessageEvent):
         sess["state"] = "IDLE"
         return
 
-    # 宅配收件人/電話/地址
     if sess["state"] == "WAIT_DELIVERY_NAME":
         sess["delivery_name"] = text
         sess["state"] = "WAIT_DELIVERY_PHONE"
@@ -784,58 +719,14 @@ def handle_message(event: MessageEvent):
         sess["state"] = "IDLE"
         return
 
-    # 轉帳回覆
-    if text.startswith("已轉帳"):
-        reply_text(event.reply_token, "收到，我們會核對帳款後依訂單號安排出貨。若需補充資訊也可在此留言。")
-        return
-        if data == "CMD:ASK_PICKUP_NAME":
-    sess["state"] = "WAIT_PICKUP_NAME"
-    reply_text(rt, "請輸入店取取件人姓名：")
-    return
-
-if data == "CMD:ASK_DELIVERY_NAME":
-    sess["state"] = "WAIT_DELIVERY_NAME"
-    reply_text(rt, "請輸入宅配收件人姓名：")
-    return
-
-    # fallback
     reply_text(event.reply_token, "輸入「甜點」看菜單，或輸入「我要下單」開始。")
 
 
 # =========================
-# LINE Handlers — Postback（所有按鈕都走這裡，不會顯示程式碼）
+# LINE Handlers — Postback
 # =========================
 @handler.add(PostbackEvent)
 def handle_postback(event: PostbackEvent):
-    # DatetimePicker 回傳會放在 event.postback.params，例如 {"date": "2026-01-10"}
-params = event.postback.params or {}
-picked_date = params.get("date")
-
-if picked_date and data == "DATE:PICKUP":
-    sess["pickup_date"] = picked_date
-    sess["state"] = "WAIT_PICKUP_TIME"
-
-    # 先讓他選時段（用按鈕）
-    reply_text(rt, f"✅ 已選店取日期：{pretty_date_tw(picked_date)}\n請選店取時段（下方按鈕）。")
-    push_quick_reply_postback(
-        user_id,
-        "請選店取時段：",
-        [
-            {"label": "10:00-12:00", "data": "時段:10:00-12:00"},
-            {"label": "12:00-14:00", "data": "時段:12:00-14:00"},
-            {"label": "14:00-16:00", "data": "時段:14:00-16:00"},
-        ],
-    )
-    return
-
-if picked_date and data == "DATE:DELIVERY":
-    sess["delivery_date"] = picked_date
-
-    # 直接出「宅配確認卡」
-    sess["state"] = "CONFIRM_DELIVERY_DATE"
-    reply_flex_dict(rt, "宅配資訊", build_confirm_card_delivery(sess))
-    return
-
     user_id = event.source.user_id
     data = (event.postback.data or "").strip()
     sess = get_session(user_id)
@@ -843,19 +734,44 @@ if picked_date and data == "DATE:DELIVERY":
 
     display_name = "LINE用戶"
 
-    # 開始下單（從菜單預覽按「我要下單」）
-    if data == "CMD:START_ORDER":
-        sess["state"] = "ORDERING"
-        show_order_menu(user_id, reply_token=rt)
+    # ---- Date Picker 回傳（最先處理） ----
+    params = event.postback.params or {}
+    picked_date = params.get("date")
+
+    if picked_date and data == "DATE:PICKUP":
+        sess["pickup_date"] = picked_date
+        sess["state"] = "WAIT_PICKUP_TIME"
+
+        reply_text(rt, f"✅ 已選店取日期：{pretty_date_tw(picked_date)}\n請選店取時段（下方按鈕）。")
+        push_quick_reply_postback(
+            user_id,
+            "請選店取時段：",
+            [
+                {"label": "10:00-12:00", "data": "時段:10:00-12:00"},
+                {"label": "12:00-14:00", "data": "時段:12:00-14:00"},
+                {"label": "14:00-16:00", "data": "時段:14:00-16:00"},
+            ],
+        )
         return
 
-    # 清空
+    if picked_date and data == "DATE:DELIVERY":
+        sess["delivery_date"] = picked_date
+        sess["state"] = "CONFIRM_DELIVERY_READY"
+        reply_flex_dict(rt, "宅配資訊", build_confirm_card_delivery(sess))
+        return
+
+    # ---- 全域指令 ----
     if data == "CMD:RESET":
         reset_session(user_id)
         reply_text(rt, "已清空。輸入「甜點」看菜單，或輸入「我要下單」開始。")
         return
 
-    # 前往結帳
+    if data == "CMD:START_ORDER":
+        sess["state"] = "ORDERING"
+        show_order_menu(user_id, reply_token=rt)
+        return
+
+    # ---- 結帳 ----
     if data == "CMD:CHECKOUT":
         if not sess["cart"]:
             reply_text(rt, "你的購物車是空的，請先輸入「我要下單」選商品。")
@@ -877,42 +793,48 @@ if picked_date and data == "DATE:DELIVERY":
         sess["state"] = "WAIT_PICKUP_METHOD"
         return
 
-    # 取貨方式（postback data 直接用你原本格式）
+    # ---- 取貨方式 ----
     if data.startswith("取貨:"):
-    method = data.split(":", 1)[1].strip()
-    if method not in ["店取", "宅配"]:
-        reply_flex_dict(rt, "取貨方式", build_pickup_method_flex())
-        return
+        method = data.split(":", 1)[1].strip()
+        if method not in ["店取", "宅配"]:
+            reply_flex_dict(rt, "取貨方式", build_pickup_method_flex())
+            return
 
-    sess["pickup_method"] = method
+        sess["pickup_method"] = method
 
-    if method == "店取":
-        sess["state"] = "WAIT_PICKUP_DATE"
-        reply_text(rt, "店取：請用下方按鈕選擇取貨日期（3～14 天內）。")
-        push_date_picker(user_id, "🌿 店取日期（3～14 天內）", "DATE:PICKUP")
-        return
+        if method == "店取":
+            sess["state"] = "WAIT_PICKUP_DATE"
+            reply_text(rt, "店取：請用下方按鈕選擇取貨日期（3～14 天內）。")
+            push_date_picker(user_id, "🌿 店取日期（3～14 天內）", "DATE:PICKUP")
+            return
 
-    if method == "宅配":
-        sess["state"] = "WAIT_DELIVERY_DATE"
-        reply_text(rt, "宅配：請用下方按鈕選擇「希望到貨日期」（3～14 天內，僅希望日不保證準時）。")
-        push_date_picker(user_id, "🚚 希望到貨日期（3～14 天內）", "DATE:DELIVERY")
-        return
+        if method == "宅配":
+            sess["state"] = "WAIT_DELIVERY_DATE"
+            reply_text(rt, "宅配：請用下方按鈕選擇「希望到貨日期」（3～14 天內，僅希望日不保證準時）。")
+            push_date_picker(user_id, "🚚 希望到貨日期（3～14 天內）", "DATE:DELIVERY")
+            return
 
-
-    # 店取時段
+    # ---- 店取時段 ----
     if data.startswith("時段:") and sess.get("state") == "WAIT_PICKUP_TIME":
-    t = data.split(":", 1)[1].strip()
-    sess["pickup_time"] = t
-    sess["state"] = "CONFIRM_PICKUP_READY"
-    reply_flex_dict(rt, "店取資訊", build_confirm_card_pickup(sess))
-    return
+        t = data.split(":", 1)[1].strip()
+        sess["pickup_time"] = t
+        sess["state"] = "CONFIRM_PICKUP_READY"
+        reply_flex_dict(rt, "店取資訊", build_confirm_card_pickup(sess))
+        return
 
+    # ---- 確認卡按鈕：進入輸入姓名 ----
+    if data == "CMD:ASK_PICKUP_NAME":
+        sess["state"] = "WAIT_PICKUP_NAME"
+        reply_text(rt, "請輸入店取取件人姓名：")
+        return
 
-    # 選品項
+    if data == "CMD:ASK_DELIVERY_NAME":
+        sess["state"] = "WAIT_DELIVERY_NAME"
+        reply_text(rt, "請輸入宅配收件人姓名：")
+        return
+
+    # ---- 選品項 ----
     if data.startswith("ITEM:"):
-        if sess.get("state") not in ["ORDERING", "WAIT_FLAVOR", "WAIT_QTY", "IDLE"]:
-            sess["state"] = "ORDERING"
-
         item_key = data.split(":", 1)[1].strip()
         if item_key not in ITEMS:
             reply_text(rt, "品項不存在，請輸入「我要下單」重新開始。")
@@ -931,7 +853,7 @@ if picked_date and data == "DATE:DELIVERY":
             sess["state"] = "WAIT_QTY"
         return
 
-    # 選口味
+    # ---- 選口味 ----
     if data.startswith("FLAVOR:"):
         flavor = data.split(":", 1)[1].strip()
         item_key = sess.get("pending_item")
@@ -951,9 +873,14 @@ if picked_date and data == "DATE:DELIVERY":
         sess["state"] = "WAIT_QTY"
         return
 
-    # 選數量
+    # ---- 選數量 ----
     if data.startswith("QTY:"):
-        qty = int(data.split(":", 1)[1].strip())
+        try:
+            qty = int(data.split(":", 1)[1].strip())
+        except Exception:
+            reply_text(rt, "數量格式錯誤，請重新選擇。")
+            return
+
         item_key = sess.get("pending_item")
         flavor = sess.get("pending_flavor")
 
@@ -973,9 +900,7 @@ if picked_date and data == "DATE:DELIVERY":
 
         total = cart_total(sess["cart"])
         reply_text(rt, f"✅ 已加入購物車\n目前小計：{total}")
-
-        after_added_actions(user_id)  # push quick reply
+        after_added_actions(user_id)
         return
 
-    # 沒匹配到
     reply_text(rt, "輸入「甜點」看菜單，或輸入「我要下單」開始。")
