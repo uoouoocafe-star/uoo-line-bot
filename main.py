@@ -2,7 +2,6 @@ import os
 import json
 import base64
 import uuid
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional, Dict, Any, List, Tuple
@@ -16,11 +15,15 @@ from linebot.v3.messaging import (
     MessagingApi,
     ReplyMessageRequest,
     TextMessage,
+    QuickReply,
+    QuickReplyItem,
+    MessageAction,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+
 
 # =========================
 # ENV
@@ -29,23 +32,22 @@ CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN", "")
 CHANNEL_SECRET = os.getenv("CHANNEL_SECRET", "")
 
 GSHEET_ID = os.getenv("GSHEET_ID", "")
-GSHEET_TAB_NAME = os.getenv("GSHEET_TAB_NAME", "sheet1")
+GSHEET_TAB_NAME = os.getenv("GSHEET_TAB_NAME", "Orders")  # 分頁名稱
 GOOGLE_SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
-# 台灣時區
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
 app = FastAPI()
-
-# LINE
 line_config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 parser = WebhookParser(CHANNEL_SECRET)
 
 # =========================
 # Business rules / prices
 # =========================
-PREORDER_DAYS = 3
+PREORDER_MIN_DAYS = 3
+PREORDER_MAX_DAYS = 14  # 你要 3~14 天
+
 SHIP_FEE = 180
 FREE_SHIP_THRESHOLD = 2500
 
@@ -56,46 +58,45 @@ PRICES = {
     "toast": 85,
 }
 
-DACQUOISE_FLAVORS = ["原味", "蜜香紅茶", "日式抹茶", "日式焙茶", "法芙娜可可"]
-TOAST_FLAVORS = ["原味", "蜜香紅茶", "日式抹茶", "日式焙茶", "法芙娜可可"]
+FLAVORS = ["原味", "蜜香紅茶", "日式抹茶", "日式焙茶", "法芙娜可可"]
+
+ITEM_LABELS = {
+    "dacquoise": "達克瓦茲",
+    "scone": "司康",
+    "canele": "可麗露",
+    "toast": "奶酥厚片",
+}
+
+# 店取時段（你可隨時改成更精準的）
+PICKUP_TIME_SLOTS = [
+    "10:00-12:00",
+    "12:00-14:00",
+    "14:00-16:00",
+]
 
 # =========================
 # Texts
 # =========================
 MENU_TEXT = (
     "🍰【UooUoo 甜點訂單】\n\n"
-    "你可以輸入：\n"
-    "1) 甜點（看菜單）\n"
-    "2) 我要下單（看下單格式）\n"
-    "3) 取貨說明\n"
-    "4) 付款說明\n\n"
-    "也可以直接貼上「下單格式」文字，我會建立訂單並寫入 Google Sheet。"
+    "請點底部選單「我要下單」用按鈕完成下單。\n\n"
+    "你也可以輸入：\n"
+    "- 甜點（看菜單）\n"
+    "- 取貨說明\n"
+    "- 付款說明"
 )
 
 DESSERT_MENU_TEXT = (
-    "🍰【甜點菜單】（全品項需前三天預訂）\n\n"
-    "1) 達克瓦茲 / 95元/顆（口味不可混、同口味至少2顆）\n"
-    "口味：原味、蜜香紅茶、日式抹茶、日式焙茶、法芙娜可可\n\n"
+    "🍰【甜點菜單】（全品項需提前預訂）\n\n"
+    "1) 達克瓦茲 / 95元/顆\n"
+    f"口味：{'、'.join(FLAVORS)}\n"
+    "（每個口味最低 2 顆）\n\n"
     "2) 原味司康 / 65元/顆\n\n"
     "3) 原味可麗露 / 90元/顆（限冷凍）\n\n"
     "4) 伊思尼奶酥厚片 / 85元/片\n"
-    "口味：原味、蜜香紅茶、日式抹茶、日式焙茶、法芙娜可可\n\n"
-    f"📌 宅配：大榮冷凍 ${SHIP_FEE} / 滿${FREE_SHIP_THRESHOLD}免運"
-)
-
-ORDER_HELP_TEXT = (
-    "🧾【下單格式】（直接複製貼上填寫）\n\n"
-    "【品項】\n"
-    "達克瓦茲 口味：____  數量：__（同口味不可混、同口味至少2顆）\n"
-    "司康 原味  數量：__\n"
-    "可麗露 原味  數量：__\n"
-    "奶酥厚片 口味：____  數量：__\n\n"
-    "【取貨方式】店取 / 宅配\n"
-    "【取貨日期】YYYY-MM-DD\n"
-    "【取貨時間】HH:MM（店取可填，宅配可不填）\n"
-    "【電話】09xxxxxxxx\n"
-    "【備註】\n\n"
-    f"📌 全品項需前三天預訂（至少 {PREORDER_DAYS} 天前）"
+    f"口味：{'、'.join(FLAVORS)}\n\n"
+    f"📌 宅配：大榮冷凍 ${SHIP_FEE} / 滿${FREE_SHIP_THRESHOLD}免運\n"
+    f"📌 取貨日期可選：下單日起第 {PREORDER_MIN_DAYS} 天～第 {PREORDER_MAX_DAYS} 天"
 )
 
 PICKUP_TEXT = (
@@ -172,289 +173,446 @@ def append_order_row(row_values: list):
 # =========================
 # LINE reply helper
 # =========================
-def reply_text(reply_token: str, text: str):
+def reply_text(reply_token: str, text: str, quick: Optional[QuickReply] = None):
     with ApiClient(line_config) as api_client:
         api = MessagingApi(api_client)
+        msg = TextMessage(text=text, quickReply=quick) if quick else TextMessage(text=text)
         api.reply_message(
             ReplyMessageRequest(
                 replyToken=reply_token,
-                messages=[TextMessage(text=text)],
+                messages=[msg],
             )
         )
 
 
+def make_quick_reply(buttons: List[Tuple[str, str]]) -> QuickReply:
+    items = [QuickReplyItem(action=MessageAction(label=label, text=text)) for label, text in buttons]
+    return QuickReply(items=items)
+
+
 # =========================
-# Parsing / Validation
+# State machine (in-memory)
 # =========================
 @dataclass
-class ParsedOrder:
-    pickup_method: str
-    pickup_date: str
-    pickup_time: str
-    phone: str
-    note: str
-    items: Dict[str, Any]          # structured items
-    subtotal: int
-    ship_fee: int
-    total: int
+class Session:
+    stage: str
+    cart: List[Dict[str, Any]]
+    temp_item_key: Optional[str] = None
+    temp_flavor: Optional[str] = None
+    pickup_method: Optional[str] = None
+    pickup_date: Optional[str] = None
+    pickup_time: Optional[str] = None
+
+    receiver_name: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None  # 宅配才需要
+    note: str = ""
 
 
-def _norm(s: str) -> str:
-    return s.replace("：", ":").replace("／", "/").strip()
+SESSIONS: Dict[str, Session] = {}
 
 
-def _extract_pickup_method(text: str) -> Optional[str]:
-    t = text
-    if "店取" in t:
-        return "店取"
-    if "宅配" in t:
-        return "宅配"
-    return None
+def get_session(user_id: str) -> Session:
+    if user_id not in SESSIONS:
+        SESSIONS[user_id] = Session(stage="IDLE", cart=[])
+    return SESSIONS[user_id]
 
 
-def _extract_date(text: str) -> Optional[str]:
-    m = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", text)
-    if not m:
-        return None
-    y, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    try:
-        d = date(y, mm, dd)
-    except ValueError:
-        return None
-    return d.strftime("%Y-%m-%d")
+def reset_session(user_id: str):
+    SESSIONS[user_id] = Session(stage="IDLE", cart=[])
 
 
-def _extract_time(text: str) -> Optional[str]:
-    m = re.search(r"\b([01]\d|2[0-3]):([0-5]\d)\b", text)
-    if not m:
-        return None
-    return f"{m.group(1)}:{m.group(2)}"
+def now_tpe_str() -> str:
+    return datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _extract_phone(text: str) -> Optional[str]:
-    # 優先抓台灣手機 09xxxxxxxx
-    m = re.search(r"\b(09\d{8})\b", text)
-    if m:
-        return m.group(1)
-    # 其次抓數字/連字號（避免太寬鬆）
-    m2 = re.search(r"\b(\d{2,4}-\d{3,4}-\d{3,4})\b", text)
-    if m2:
-        return m2.group(1)
-    return None
+def gen_order_id() -> str:
+    return f"UOO-{datetime.now(TZ_TAIPEI).strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
 
 
-def _parse_qty(line: str) -> int:
-    m = re.search(r"數量\s*[:：]?\s*(\d+)", line)
-    if m:
-        return int(m.group(1))
-    # 也容許「x2」或「2顆/2個/2片」
-    m2 = re.search(r"(?:x|X)\s*(\d+)", line)
-    if m2:
-        return int(m2.group(1))
-    m3 = re.search(r"\b(\d+)\s*(?:顆|個|片)\b", line)
-    if m3:
-        return int(m3.group(1))
-    return 0
+def calc_subtotal(cart: List[Dict[str, Any]]) -> int:
+    return sum(int(x["subtotal"]) for x in cart)
 
 
-def _parse_flavor(line: str) -> Optional[str]:
-    # 口味:____
-    m = re.search(r"口味\s*[:：]\s*([^\s]+)", line)
-    if m:
-        return m.group(1).strip()
-    # 或者行內直接出現口味字樣
-    for f in DACQUOISE_FLAVORS + TOAST_FLAVORS:
-        if f in line:
-            return f
-    return None
+def calc_ship_fee(subtotal: int, pickup_method: str) -> int:
+    if pickup_method != "宅配":
+        return 0
+    return 0 if subtotal >= FREE_SHIP_THRESHOLD else SHIP_FEE
 
 
-def _has_mixed_flavors_in_one_field(flavor_str: str) -> bool:
-    # 口味不可混：檢查是否含「、/ /, +」這類混合符號
-    return any(sep in flavor_str for sep in ["、", "/", ",", "+", "＋", "與", "and", "And"])
-
-
-def _validate_preorder(pickup_date_str: str) -> Tuple[bool, str]:
-    try:
-        y, mm, dd = map(int, pickup_date_str.split("-"))
-        pickup = date(y, mm, dd)
-    except Exception:
-        return False, "取貨日期格式錯誤，請用 YYYY-MM-DD"
-
-    today = datetime.now(TZ_TAIPEI).date()
-    delta = (pickup - today).days
-    if delta < PREORDER_DAYS:
-        return False, f"全品項需前三天預訂（至少 {PREORDER_DAYS} 天前）。你填的取貨日距今天只有 {delta} 天。"
-    return True, ""
-
-
-def parse_order_text_strict(text: str) -> Tuple[Optional[ParsedOrder], List[str]]:
-    """
-    解析 + 驗證（不過就回 errors）
-    """
-    errors: List[str] = []
-    raw = text.strip()
-
-    pickup_method = _extract_pickup_method(raw)
-    if not pickup_method:
-        errors.append("缺少【取貨方式】請填：店取 或 宅配")
-
-    pickup_date = _extract_date(raw)
-    if not pickup_date:
-        errors.append("缺少【取貨日期】請填：YYYY-MM-DD")
-
-    pickup_time = _extract_time(raw) or ""
-    phone = _extract_phone(raw)
-    if not phone:
-        errors.append("缺少【電話】請填：09xxxxxxxx")
-
-    # 解析品項：逐行掃
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    dacq_by_flavor: Dict[str, int] = {}
-    scone_qty = 0
-    canele_qty = 0
-    toast_by_flavor: Dict[str, int] = {}
-
-    for line in lines:
-        ln = _norm(line)
-
-        if "達克瓦茲" in ln:
-            qty = _parse_qty(ln)
-            flavor = _parse_flavor(ln)
-            if not flavor:
-                errors.append("達克瓦茲需填【口味】")
-                continue
-            if _has_mixed_flavors_in_one_field(flavor):
-                errors.append("達克瓦茲【口味不可混】請一行只填一種口味（例如：達克瓦茲 口味：原味 數量：2）")
-                continue
-            if flavor not in DACQUOISE_FLAVORS:
-                errors.append(f"達克瓦茲口味不在清單內：{flavor}")
-                continue
-            if qty <= 0:
-                errors.append("達克瓦茲需填【數量】且大於 0")
-                continue
-            dacq_by_flavor[flavor] = dacq_by_flavor.get(flavor, 0) + qty
-
-        elif "司康" in ln:
-            qty = _parse_qty(ln)
-            if qty <= 0:
-                errors.append("司康需填【數量】且大於 0")
-                continue
-            scone_qty += qty
-
-        elif "可麗露" in ln:
-            qty = _parse_qty(ln)
-            if qty <= 0:
-                errors.append("可麗露需填【數量】且大於 0")
-                continue
-            canele_qty += qty
-
-        elif ("奶酥厚片" in ln) or ("厚片" in ln and "奶酥" in ln):
-            qty = _parse_qty(ln)
-            flavor = _parse_flavor(ln)
-            if not flavor:
-                errors.append("奶酥厚片需填【口味】")
-                continue
-            if _has_mixed_flavors_in_one_field(flavor):
-                errors.append("奶酥厚片口味請一行只填一種口味")
-                continue
-            if flavor not in TOAST_FLAVORS:
-                errors.append(f"奶酥厚片口味不在清單內：{flavor}")
-                continue
-            if qty <= 0:
-                errors.append("奶酥厚片需填【數量】且大於 0")
-                continue
-            toast_by_flavor[flavor] = toast_by_flavor.get(flavor, 0) + qty
-
-    if not dacq_by_flavor and scone_qty == 0 and canele_qty == 0 and not toast_by_flavor:
-        errors.append("沒有解析到任何品項。請照【下單格式】填寫。")
-
-    # 達克瓦茲規則：同口味至少2顆
-    for f, q in dacq_by_flavor.items():
-        if q < 2:
-            errors.append(f"達克瓦茲（{f}）同口味最低購買 2 顆，目前是 {q} 顆")
-
-    # 三天預訂檢查（要有日期才檢）
-    if pickup_date:
-        ok, msg = _validate_preorder(pickup_date)
-        if not ok:
-            errors.append(msg)
-
-    if errors:
-        return None, errors
-
-    # 計算金額
-    dacq_total_qty = sum(dacq_by_flavor.values())
-    toast_total_qty = sum(toast_by_flavor.values())
-
-    subtotal = (
-        dacq_total_qty * PRICES["dacquoise"]
-        + scone_qty * PRICES["scone"]
-        + canele_qty * PRICES["canele"]
-        + toast_total_qty * PRICES["toast"]
-    )
-
-    ship_fee = 0
-    if pickup_method == "宅配":
-        ship_fee = 0 if subtotal >= FREE_SHIP_THRESHOLD else SHIP_FEE
-
-    total = subtotal + ship_fee
-
-    items = {
-        "dacquoise": [{"flavor": f, "qty": q, "unit_price": PRICES["dacquoise"]} for f, q in dacq_by_flavor.items()],
-        "scone": {"qty": scone_qty, "unit_price": PRICES["scone"]},
-        "canele": {"qty": canele_qty, "unit_price": PRICES["canele"]},
-        "toast": [{"flavor": f, "qty": q, "unit_price": PRICES["toast"]} for f, q in toast_by_flavor.items()],
-        "shipping": {"method": pickup_method, "fee": ship_fee, "free_threshold": FREE_SHIP_THRESHOLD},
-        "subtotal": subtotal,
-        "total": total,
-    }
-
-    # note：把電話/取貨資訊也保留（方便你對帳）
-    note = raw
-
-    parsed = ParsedOrder(
-        pickup_method=pickup_method,
-        pickup_date=pickup_date,
-        pickup_time=pickup_time if pickup_method == "店取" else "",
-        phone=phone,
-        note=note,
-        items=items,
-        subtotal=subtotal,
-        ship_fee=ship_fee,
-        total=total,
-    )
-    return parsed, []
-
-
-def build_error_reply(errors: List[str]) -> str:
-    lines = ["⚠️ 你的下單資訊有缺/不符合規則，請修正後再貼一次：", ""]
-    for e in errors[:10]:
-        lines.append(f"・{e}")
-    lines.append("")
-    lines.append("請用這個格式：")
-    lines.append(ORDER_HELP_TEXT)
+def cart_summary(cart: List[Dict[str, Any]]) -> str:
+    if not cart:
+        return "（目前尚未選擇任何品項）"
+    lines = []
+    for x in cart:
+        f = f"（{x['flavor']}）" if x.get("flavor") else ""
+        lines.append(f"- {x['label']}{f} x{x['qty']} = {x['subtotal']}")
     return "\n".join(lines)
 
 
-def build_success_reply(order_id: str, parsed: ParsedOrder) -> str:
-    ship_line = ""
-    if parsed.pickup_method == "宅配":
-        ship_line = f"\n宅配運費：{parsed.ship_fee}（滿{FREE_SHIP_THRESHOLD}免運）"
+def build_date_buttons_3_to_14() -> List[Tuple[str, str]]:
+    """
+    只提供：今天起 +3 天 ~ +14 天（共 12 天）
+    Quick Reply 最多 13 個（含取消剛好 13）
+    """
+    today = datetime.now(TZ_TAIPEI).date()
+    buttons: List[Tuple[str, str]] = []
+    for offset in range(PREORDER_MIN_DAYS, PREORDER_MAX_DAYS + 1):
+        dd = today + timedelta(days=offset)
+        label = dd.strftime("%m/%d")
+        text = f"DATE:{dd.strftime('%Y-%m-%d')}"
+        buttons.append((label, text))
+    buttons.append(("❌ 取消", "CANCEL"))
+    return buttons
 
-    return (
-        "✅ 已建立訂單並登記成功！\n\n"
-        f"訂單編號：{order_id}\n"
-        f"取貨方式：{parsed.pickup_method}\n"
-        f"取貨日期：{parsed.pickup_date}\n"
-        + (f"取貨時間：{parsed.pickup_time}\n" if parsed.pickup_method == "店取" and parsed.pickup_time else "")
-        + f"小計：{parsed.subtotal}"
-        + ship_line
-        + f"\n應付總額：{parsed.total}\n\n"
-        "接下來請依「付款說明」完成匯款。\n"
-        "匯款後回覆：已轉帳 訂單編號 末五碼12345\n\n"
-        "（對帳後會依序出貨/通知取貨）"
+
+def qty_buttons(min_qty: int) -> List[Tuple[str, str]]:
+    opts = [min_qty, min_qty + 1, min_qty + 2, min_qty + 3, min_qty + 4]
+    buttons = [(str(n), f"QTY:{n}") for n in opts]
+    buttons.append(("⬅️ 返回品項", "START_ORDER"))
+    buttons.append(("❌ 取消", "CANCEL"))
+    return buttons
+
+
+def time_slot_buttons() -> List[Tuple[str, str]]:
+    buttons = [(slot, f"TIME:{slot}") for slot in PICKUP_TIME_SLOTS]
+    buttons.append(("⬅️ 返回日期", "BACK_TO_DATE"))
+    buttons.append(("❌ 取消", "CANCEL"))
+    return buttons
+
+
+# =========================
+# Flow handlers
+# =========================
+def handle_start_order(reply_token: str, user_id: str):
+    s = get_session(user_id)
+    s.stage = "CHOOSE_ITEM"
+    s.temp_item_key = None
+    s.temp_flavor = None
+
+    qr = make_quick_reply([
+        ("🍰 達克瓦茲", "ITEM:dacquoise"),
+        ("🥐 司康", "ITEM:scone"),
+        ("🍮 可麗露", "ITEM:canele"),
+        ("🍞 奶酥厚片", "ITEM:toast"),
+        ("➡️ 下一步", "NEXT_TO_PICKUP"),
+        ("❌ 取消", "CANCEL"),
+    ])
+    reply_text(reply_token, "請選擇要購買的品項：", quick=qr)
+
+
+def handle_choose_item(reply_token: str, user_id: str, item_key: str):
+    s = get_session(user_id)
+    if item_key not in ITEM_LABELS:
+        reply_text(reply_token, "品項不正確，請重新選擇。")
+        return
+
+    s.temp_item_key = item_key
+    s.temp_flavor = None
+
+    if item_key in ["dacquoise", "toast"]:
+        s.stage = "CHOOSE_FLAVOR"
+        qr = make_quick_reply(
+            [(f, f"FLAVOR:{f}") for f in FLAVORS] +
+            [("⬅️ 返回品項", "START_ORDER"), ("❌ 取消", "CANCEL")]
+        )
+        reply_text(reply_token, f"你選了，請選口味：", quick=qr)
+        return
+
+    s.stage = "CHOOSE_QTY"
+    qr = make_quick_reply(qty_buttons(1))
+    reply_text(reply_token, f"你選了，請選數量：", quick=qr)
+
+
+def handle_choose_flavor(reply_token: str, user_id: str, flavor: str):
+    s = get_session(user_id)
+    if s.temp_item_key not in ["dacquoise", "toast"]:
+        reply_text(reply_token, "目前不在選口味流程，請點「我要下單」重新開始。")
+        return
+    if flavor not in FLAVORS:
+        reply_text(reply_token, "口味不在清單內，請重新選擇。")
+        return
+
+    s.temp_flavor = flavor
+    s.stage = "CHOOSE_QTY"
+
+    min_qty = 2 if s.temp_item_key == "dacquoise" else 1
+    qr = make_quick_reply(qty_buttons(min_qty))
+    reply_text(reply_token, f"口味：{flavor}\n請選數量：", quick=qr)
+
+
+def add_to_cart(user_id: str, item_key: str, flavor: Optional[str], qty: int):
+    label = ITEM_LABELS[item_key]
+    unit = PRICES[item_key]
+    subtotal = qty * unit
+
+    s = get_session(user_id)
+    for x in s.cart:
+        if x["item_key"] == item_key and x.get("flavor") == flavor:
+            x["qty"] += qty
+            x["subtotal"] += subtotal
+            return
+
+    s.cart.append({
+        "item_key": item_key,
+        "label": label,
+        "flavor": flavor,
+        "qty": qty,
+        "unit_price": unit,
+        "subtotal": subtotal,
+    })
+
+
+def handle_choose_qty(reply_token: str, user_id: str, qty: int):
+    s = get_session(user_id)
+    item_key = s.temp_item_key
+    if not item_key:
+        reply_text(reply_token, "尚未選擇品項，請點「我要下單」重新開始。")
+        return
+
+    if item_key == "dacquoise" and qty < 2:
+        reply_text(reply_token, "達克瓦茲每個口味最低 2 顆，請重新選擇。")
+        return
+
+    flavor = s.temp_flavor if item_key in ["dacquoise", "toast"] else None
+    add_to_cart(user_id, item_key, flavor, qty)
+
+    s.temp_item_key = None
+    s.temp_flavor = None
+    s.stage = "CHOOSE_ITEM"
+
+    subtotal = calc_subtotal(s.cart)
+    msg = "✅ 已加入購物車\n\n" + cart_summary(s.cart) + f"\n\n目前小計：{subtotal}"
+    qr = make_quick_reply([
+        ("➕ 再加購", "START_ORDER"),
+        ("➡️ 下一步", "NEXT_TO_PICKUP"),
+        ("❌ 取消", "CANCEL"),
+    ])
+    reply_text(reply_token, msg, quick=qr)
+
+
+def handle_next_to_pickup(reply_token: str, user_id: str):
+    s = get_session(user_id)
+    if not s.cart:
+        qr = make_quick_reply([
+            ("➕ 先選品項", "START_ORDER"),
+            ("❌ 取消", "CANCEL"),
+        ])
+        reply_text(reply_token, "你目前還沒選品項喔，先選品項再結帳。", quick=qr)
+        return
+
+    s.stage = "CHOOSE_PICKUP"
+    qr = make_quick_reply([
+        ("🏠 店取", "PICKUP:店取"),
+        ("🚚 宅配", "PICKUP:宅配"),
+        ("⬅️ 返回加購", "START_ORDER"),
+        ("❌ 取消", "CANCEL"),
+    ])
+    reply_text(reply_token, "請選擇取貨方式：", quick=qr)
+
+
+def handle_pickup(reply_token: str, user_id: str, method: str):
+    s = get_session(user_id)
+    if method not in ["店取", "宅配"]:
+        reply_text(reply_token, "取貨方式不正確，請重新選擇。")
+        return
+
+    s.pickup_method = method
+    s.stage = "CHOOSE_DATE"
+    s.pickup_date = None
+    s.pickup_time = None
+
+    qr = make_quick_reply(build_date_buttons_3_to_14())
+    reply_text(reply_token, f"你選擇。\n請選擇取貨日期（僅提供 +3～+14 天）：", quick=qr)
+
+
+def handle_date(reply_token: str, user_id: str, date_str: str):
+    s = get_session(user_id)
+    try:
+        y, m, d = map(int, date_str.split("-"))
+        dd = date(y, m, d)
+    except Exception:
+        reply_text(reply_token, "日期格式錯誤，請重新選擇。")
+        return
+
+    today = datetime.now(TZ_TAIPEI).date()
+    delta = (dd - today).days
+    if delta < PREORDER_MIN_DAYS or delta > PREORDER_MAX_DAYS:
+        reply_text(reply_token, f"取貨日期僅提供下單日起第 {PREORDER_MIN_DAYS} 天～第 {PREORDER_MAX_DAYS} 天，請重新選擇。")
+        return
+
+    s.pickup_date = date_str
+
+    if s.pickup_method == "店取":
+        s.stage = "CHOOSE_TIME"
+        qr = make_quick_reply(time_slot_buttons())
+        reply_text(reply_token, "請選擇店取時段：", quick=qr)
+        return
+
+    # 宅配：先收姓名 → 電話 → 地址
+    s.stage = "INPUT_NAME"
+    reply_text(reply_token, "請輸入收件人姓名：")
+
+
+def handle_back_to_date(reply_token: str, user_id: str):
+    s = get_session(user_id)
+    if not s.pickup_method:
+        handle_next_to_pickup(reply_token, user_id)
+        return
+    s.stage = "CHOOSE_DATE"
+    s.pickup_date = None
+    s.pickup_time = None
+    qr = make_quick_reply(build_date_buttons_3_to_14())
+    reply_text(reply_token, f"請重新選擇取貨日期（僅提供 +3～+14 天）：", quick=qr)
+
+
+def handle_time(reply_token: str, user_id: str, slot: str):
+    s = get_session(user_id)
+    if s.pickup_method != "店取":
+        reply_text(reply_token, "目前不是店取流程，請重新開始。")
+        return
+    if slot not in PICKUP_TIME_SLOTS:
+        reply_text(reply_token, "時段不正確，請重新選擇。")
+        return
+
+    s.pickup_time = slot
+    s.stage = "INPUT_NAME"
+    reply_text(reply_token, "請輸入取件人姓名：")
+
+
+def handle_cancel(reply_token: str, user_id: str):
+    reset_session(user_id)
+    reply_text(reply_token, "已取消本次下單流程。需要再下單請點「我要下單」。")
+
+
+def handle_input_name(reply_token: str, user_id: str, name: str):
+    name = name.strip()
+    if not name or len(name) > 20:
+        reply_text(reply_token, "姓名格式不正確，請重新輸入（1～20字）。")
+        return
+    s = get_session(user_id)
+    s.receiver_name = name
+    s.stage = "INPUT_PHONE"
+    reply_text(reply_token, "請輸入電話（例如 0912345678）：")
+
+
+def handle_input_phone(reply_token: str, user_id: str, phone: str):
+    phone = phone.strip()
+    if not phone.startswith("09") or len(phone) != 10 or not phone.isdigit():
+        reply_text(reply_token, "電話格式不正確，請輸入 09xxxxxxxx（10 碼數字）。")
+        return
+
+    s = get_session(user_id)
+    s.phone = phone
+
+    if s.pickup_method == "宅配":
+        s.stage = "INPUT_ADDRESS"
+        reply_text(reply_token, "請輸入宅配地址（縣市＋路名門牌＋樓層/房號）：")
+        return
+
+    # 店取：直接送出
+    submit_order(reply_token, user_id, event_user_id=user_id)
+
+
+def handle_input_address(reply_token: str, user_id: str, address: str):
+    address = address.strip()
+    if not address or len(address) < 6:
+        reply_text(reply_token, "地址看起來太短，請輸入完整地址（縣市＋路名門牌＋樓層/房號）。")
+        return
+
+    s = get_session(user_id)
+    s.address = address
+    submit_order(reply_token, user_id, event_user_id=user_id)
+
+
+def submit_order(reply_token: str, user_id: str, event_user_id: str):
+    s = get_session(user_id)
+    if not s.cart or not s.pickup_method or not s.pickup_date or not s.receiver_name or not s.phone:
+        reply_text(reply_token, "訂單資訊不完整，請點「我要下單」重新開始。")
+        return
+    if s.pickup_method == "店取" and not s.pickup_time:
+        reply_text(reply_token, "缺少店取時段，請重新選擇。")
+        return
+    if s.pickup_method == "宅配" and not s.address:
+        reply_text(reply_token, "缺少宅配地址，請重新輸入。")
+        return
+
+    subtotal = calc_subtotal(s.cart)
+    ship_fee = calc_ship_fee(subtotal, s.pickup_method)
+    total = subtotal + ship_fee
+
+    order_id = gen_order_id()
+    created_at = now_tpe_str()
+
+    items_json = json.dumps(
+        {
+            "cart": s.cart,
+            "pickup_method": s.pickup_method,
+            "pickup_date": s.pickup_date,
+            "pickup_time": s.pickup_time or "",
+            "receiver_name": s.receiver_name,
+            "phone": s.phone,
+            "address": s.address or "",
+            "subtotal": subtotal,
+            "ship_fee": ship_fee,
+            "total": total,
+        },
+        ensure_ascii=False,
     )
+
+    # note：留給你人工對帳/出貨最常用資訊
+    if s.pickup_method == "店取":
+        note = f"取件人:{s.receiver_name}｜電話:{s.phone}"
+    else:
+        note = f"收件人:{s.receiver_name}｜電話:{s.phone}｜地址:{s.address}"
+
+    row = [
+        created_at,            # created_at
+        event_user_id or "",   # user_id
+        "",                    # display_name
+        order_id,              # order_id
+        items_json,            # items_json
+        s.pickup_method,       # pickup_method
+        s.pickup_date,         # pickup_date
+        s.pickup_time or "",   # pickup_time
+        note,                  # note
+        str(total),            # amount
+        "UNPAID",              # pay_status
+        "",                    # linepay_transaction_id
+    ]
+
+    try:
+        append_order_row(row)
+    except Exception as e:
+        reply_text(reply_token, f"⚠️ 建單成功但寫入 Orders 失敗：{e}\n請把這段錯誤貼給我，我幫你修。")
+        return
+
+    ship_line = ""
+    if s.pickup_method == "宅配":
+        ship_line = f"\n宅配運費：{ship_fee}（滿{FREE_SHIP_THRESHOLD}免運）"
+
+    time_line = ""
+    if s.pickup_method == "店取":
+        time_line = f"\n店取時段：{s.pickup_time}"
+
+    msg = (
+        "✅ 已建立訂單！\n\n"
+        f"訂單編號：{order_id}\n"
+        f"取貨方式：{s.pickup_method}\n"
+        f"取貨日期：{s.pickup_date}"
+        f"{time_line}\n\n"
+        "🧾 訂單內容\n"
+        f"{cart_summary(s.cart)}\n\n"
+        f"小計：{subtotal}"
+        f"{ship_line}\n"
+        f"應付總額：{total}\n\n"
+        "接下來請依「付款說明」完成匯款。\n"
+        "匯款後回覆：已轉帳 訂單編號 末五碼12345\n"
+        "（核帳後依序出貨/通知取貨）"
+    )
+
+    reset_session(user_id)
+    reply_text(reply_token, msg)
 
 
 # =========================
@@ -479,18 +637,16 @@ async def callback(request: Request):
     for event in events:
         if isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
             user_text = (event.message.text or "").strip()
+            user_id = event.source.user_id if event.source else ""
+            s = get_session(user_id)
 
-            # 固定指令（按鈕/文字）
+            # ---------- 基礎指令 ----------
             if user_text in ["menu", "選單", "開始", "hi", "hello", "你好"]:
                 reply_text(event.reply_token, MENU_TEXT)
                 continue
 
             if user_text in ["甜點", "菜單"]:
                 reply_text(event.reply_token, DESSERT_MENU_TEXT)
-                continue
-
-            if user_text in ["我要下單", "下單"]:
-                reply_text(event.reply_token, ORDER_HELP_TEXT)
                 continue
 
             if user_text in ["取貨說明", "取貨"]:
@@ -501,46 +657,74 @@ async def callback(request: Request):
                 reply_text(event.reply_token, PAY_TEXT)
                 continue
 
-            # 其他文字：當作下單內容，做嚴格解析
-            parsed, errors = parse_order_text_strict(user_text)
-            if errors:
-                reply_text(event.reply_token, build_error_reply(errors))
+            # ---------- 啟動按鈕下單 ----------
+            if user_text in ["我要下單", "下單", "START_ORDER"]:
+                handle_start_order(event.reply_token, user_id)
                 continue
 
-            # 建立訂單 + 寫入
-            order_id = f"UOO-{datetime.now(TZ_TAIPEI).strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
-            created_at = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
-            user_id = event.source.user_id if event.source else ""
-            display_name = ""  # 下一版可加 profile 取得
-
-            items_json = json.dumps(parsed.items, ensure_ascii=False)
-
-            row = [
-                created_at,             # created_at
-                user_id,                # user_id
-                display_name,           # display_name
-                order_id,               # order_id
-                items_json,             # items_json (structured)
-                parsed.pickup_method,   # pickup_method
-                parsed.pickup_date,     # pickup_date
-                parsed.pickup_time,     # pickup_time
-                parsed.note,            # note (含電話/全部原文)
-                str(parsed.total),      # amount
-                "UNPAID",               # pay_status
-                "",                     # linepay_transaction_id
-            ]
-
-            try:
-                append_order_row(row)
-            except Exception as e:
-                reply_text(
-                    event.reply_token,
-                    "⚠️ 我收到你的訊息了，但寫入訂單失敗。\n\n"
-                    f"錯誤：{e}\n\n"
-                    "請把這段錯誤貼回給我，我會幫你修。"
-                )
+            # ---------- 取消 ----------
+            if user_text == "CANCEL":
+                handle_cancel(event.reply_token, user_id)
                 continue
 
-            reply_text(event.reply_token, build_success_reply(order_id, parsed))
+            # ---------- Quick Reply 指令 ----------
+            if user_text.startswith("ITEM:"):
+                handle_choose_item(event.reply_token, user_id, user_text.split(":", 1)[1])
+                continue
+
+            if user_text.startswith("FLAVOR:"):
+                handle_choose_flavor(event.reply_token, user_id, user_text.split(":", 1)[1])
+                continue
+
+            if user_text.startswith("QTY:"):
+                try:
+                    qty = int(user_text.split(":", 1)[1])
+                except Exception:
+                    reply_text(event.reply_token, "數量不正確，請重新選擇。")
+                    continue
+                handle_choose_qty(event.reply_token, user_id, qty)
+                continue
+
+            if user_text == "NEXT_TO_PICKUP":
+                handle_next_to_pickup(event.reply_token, user_id)
+                continue
+
+            if user_text.startswith("PICKUP:"):
+                handle_pickup(event.reply_token, user_id, user_text.split(":", 1)[1])
+                continue
+
+            if user_text.startswith("DATE:"):
+                handle_date(event.reply_token, user_id, user_text.split(":", 1)[1])
+                continue
+
+            if user_text == "BACK_TO_DATE":
+                handle_back_to_date(event.reply_token, user_id)
+                continue
+
+            if user_text.startswith("TIME:"):
+                handle_time(event.reply_token, user_id, user_text.split(":", 1)[1])
+                continue
+
+            # ---------- 依 stage 接收文字輸入 ----------
+            if s.stage == "INPUT_NAME":
+                handle_input_name(event.reply_token, user_id, user_text)
+                continue
+
+            if s.stage == "INPUT_PHONE":
+                handle_input_phone(event.reply_token, user_id, user_text)
+                continue
+
+            if s.stage == "INPUT_ADDRESS":
+                handle_input_address(event.reply_token, user_id, user_text)
+                continue
+
+            # ---------- 其他：提示 ----------
+            qr = make_quick_reply([
+                ("🧾 我要下單", "START_ORDER"),
+                ("🍰 看甜點", "甜點"),
+                ("📦 取貨說明", "取貨說明"),
+                ("💸 付款說明", "付款說明"),
+            ])
+            reply_text(event.reply_token, "我建議你用按鈕下單比較快：", quick=qr)
 
     return "OK"
