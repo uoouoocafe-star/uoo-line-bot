@@ -177,7 +177,7 @@ def append_order_row(row: List[Any]) -> bool:
         return False
 
     try:
-        range_ = f"{SHEET_NAME}!A1"
+        range_ = f"'{SHEET_NAME}'!A1"
         body = {"values": [row]}
         service.spreadsheets().values().append(
             spreadsheetId=GSHEET_ID,
