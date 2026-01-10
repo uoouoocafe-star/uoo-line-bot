@@ -678,8 +678,8 @@ def flex_choose_qty(item_id: str, flavor: str, name: str) -> Dict[str, Any]:
             "type": "button", "style": "secondary",
             "action": {"type": "postback", "label": str(q), "data": f"PB:QTY:{item_id}:{flavor}:{q}"},
         })
-    title = "選擇數量"
-    subtitle = f"{name}" + (f"（{flavor}）" if flavor else "")
+    title = "選擇盒數"
+subtitle = f"{name}" + (f"（{flavor}）" if flavor else "") + "｜1 = 1盒"
     return {
         "type": "flex",
         "altText": "選擇數量",
