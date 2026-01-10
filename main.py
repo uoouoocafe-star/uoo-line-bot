@@ -4,8 +4,8 @@ import base64
 import hmac
 import hashlib
 import random
+import re
 import string
-import time
 from datetime import datetime, timedelta, timezone, date
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -27,17 +27,17 @@ GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
-# A/B/C 表
+# A/B/C 表（你說 A=orders）
 SHEET_A_NAME = os.getenv("SHEET_NAME", "orders").strip()  # A表（orders）
 SHEET_B_NAME = os.getenv("SHEET_B_NAME", "order_items_readable").strip()  # B表
-SHEET_C_NAME = os.getenv("SHEET_C_NAME", "cashflow").strip()  # C表
+SHEET_C_NAME = os.getenv("SHEET_C_NAME", "cashflow").strip()  # C主表（狀態總表，一單一列）
+SHEET_C_LOG_NAME = os.getenv("SHEET_C_LOG_NAME", "cashflow_log").strip()  # C_log（事件紀錄）
 SHEET_SETTINGS_NAME = os.getenv("SHEET_SETTINGS_NAME", "settings").strip()  # settings（可無）
 
 # 管理員 ID（逗號分隔）
 ADMIN_USER_IDS = [x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()]
 
 TZ = timezone(timedelta(hours=8))  # Asia/Taipei
-
 LINE_API_BASE = "https://api.line.me/v2/bot/message"
 
 PICKUP_ADDRESS = os.getenv("PICKUP_ADDRESS", "新竹縣竹北市隘口六街65號").strip()
@@ -71,44 +71,35 @@ PICKUP_NOTICE = os.getenv(
 ).strip()
 
 
-def parse_int_env(name: str, default: int) -> int:
+def safe_int_env(name: str, default: int) -> int:
     """
-    Render 上有人會把環境變數設成 "(3)" 或 " 3 "，這裡做強韌解析。
+    允許 MIN_DAYS 設成 "(3)" 這種也能轉成功
     """
     raw = (os.getenv(name, "") or "").strip()
     if not raw:
         return default
-    raw = raw.replace("（", "(").replace("）", ")")
-    raw = raw.strip()
-    if raw.startswith("(") and raw.endswith(")"):
-        raw = raw[1:-1].strip()
+    # 只取數字（含負號不需要）
+    m = re.findall(r"\d+", raw)
+    if not m:
+        return default
     try:
-        return int(raw)
+        return int(m[0])
     except:
-        # 最後再撈一次：把非數字拔掉（保底）
-        digits = "".join([c for c in raw if c.isdigit() or c == "-"])
-        try:
-            return int(digits)
-        except:
-            return default
+        return default
 
 
 # 日期規則
-MIN_DAYS = parse_int_env("MIN_DAYS", 3)
-MAX_DAYS = parse_int_env("MAX_DAYS", 14)
+MIN_DAYS = safe_int_env("MIN_DAYS", 3)
+MAX_DAYS = safe_int_env("MAX_DAYS", 14)
 
 # 公休日（ENV 可先用，settings sheet 可覆蓋）
+# CLOSED_WEEKDAYS: 週二=2（你習慣）可多個，例如 "2,3"
 ENV_CLOSED_WEEKDAYS = os.getenv("CLOSED_WEEKDAYS", "2").strip()
+# CLOSED_DATES: 例如 "2026-01-13,2026-01-14"
 ENV_CLOSED_DATES = os.getenv("CLOSED_DATES", "").strip()
 
 # 店取時段
 PICKUP_SLOTS = ["10:00-12:00", "12:00-14:00", "14:00-16:00"]
-
-# 視覺風格（純色系，可自行改）
-COLOR_BG = "#FFF7F9"
-COLOR_TEXT_DIM = "#6B6B6B"
-COLOR_PRIMARY_BTN = "#2ECC71"  # 綠
-COLOR_SECONDARY_BTN = "#EDEDED"
 
 
 # =========================
@@ -127,6 +118,7 @@ def get_session(user_id: str) -> Dict[str, Any]:
         SESSIONS[user_id] = {
             "ordering": False,
             "state": "IDLE",
+
             "cart": [],
             "pending_item": None,
             "pending_flavor": None,
@@ -158,17 +150,14 @@ TOAST_FLAVORS = ["原味", "蜜香紅茶", "日式抹茶", "日式焙茶", "法�
 ITEMS = {
     "dacquoise": {"label": "達克瓦茲", "unit_price": 95, "has_flavor": True,  "flavors": DACQUOISE_FLAVORS, "min_qty": 1, "step": 1},
     "scone":     {"label": "原味司康", "unit_price": 65, "has_flavor": False, "flavors": [],               "min_qty": 1, "step": 1},
-    "canele6":   {"label": "可麗露 6顆/盒", "unit_price": 490, "has_flavor": False, "flavors": [],          "min_qty": 1, "step": 1},
-    "toast":     {"label": "伊思尼奶酥厚片", "unit_price": 85, "has_flavor": True, "flavors": TOAST_FLAVORS, "min_qty": 1, "step": 1},
+    "canele6":   {"label": "可麗露 6顆/盒", "unit_price": 490, "has_flavor": False, "flavors": [],        "min_qty": 1, "step": 1},
+    "toast":     {"label": "伊思尼奶酥厚片", "unit_price": 85, "has_flavor": True, "flavors": TOAST_FLAVORS,"min_qty": 1, "step": 1},
 }
 
 
 # =========================
 # LINE API (no SDK)
 # =========================
-_HTTP = requests.Session()
-
-
 def line_headers() -> dict:
     return {
         "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
@@ -176,34 +165,32 @@ def line_headers() -> dict:
     }
 
 
-def safe_post(url: str, payload: dict, timeout: int = 12) -> Tuple[int, str]:
-    try:
-        r = _HTTP.post(url, headers=line_headers(), data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), timeout=timeout)
-        return r.status_code, r.text
-    except Exception as e:
-        return 599, str(e)
-
-
 def line_reply(reply_token: str, messages: List[dict]):
     if not CHANNEL_ACCESS_TOKEN:
         return
-    if not reply_token:
-        return
     payload = {"replyToken": reply_token, "messages": messages}
-    status, text = safe_post(f"{LINE_API_BASE}/reply", payload, timeout=12)
-    if status >= 300:
-        print("[ERROR] reply failed:", status, text)
+    r = requests.post(
+        f"{LINE_API_BASE}/reply",
+        headers=line_headers(),
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        timeout=15,
+    )
+    if r.status_code >= 300:
+        print("[ERROR] reply failed:", r.status_code, r.text)
 
 
 def line_push(user_id: str, messages: List[dict]):
     if not CHANNEL_ACCESS_TOKEN:
         return
-    if not user_id:
-        return
     payload = {"to": user_id, "messages": messages}
-    status, text = safe_post(f"{LINE_API_BASE}/push", payload, timeout=12)
-    if status >= 300:
-        print("[ERROR] push failed:", status, text)
+    r = requests.post(
+        f"{LINE_API_BASE}/push",
+        headers=line_headers(),
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        timeout=15,
+    )
+    if r.status_code >= 300:
+        print("[ERROR] push failed:", r.status_code, r.text)
 
 
 def msg_text(text: str, quick_items: Optional[List[dict]] = None) -> dict:
@@ -229,12 +216,8 @@ def msg_flex(alt_text: str, contents: dict) -> dict:
 
 
 # =========================
-# Google Sheets (cached)
+# Google Sheets
 # =========================
-_SHEETS_SERVICE = None
-_SHEETS_SERVICE_AT = 0
-
-
 def load_service_account_info() -> Optional[dict]:
     if GOOGLE_SERVICE_ACCOUNT_B64:
         try:
@@ -253,18 +236,12 @@ def load_service_account_info() -> Optional[dict]:
 
 
 def get_sheets_service():
-    global _SHEETS_SERVICE, _SHEETS_SERVICE_AT
-    if _SHEETS_SERVICE and (time.time() - _SHEETS_SERVICE_AT) < 600:
-        return _SHEETS_SERVICE
-
     info = load_service_account_info()
     if not info:
         return None
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-    _SHEETS_SERVICE = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    _SHEETS_SERVICE_AT = time.time()
-    return _SHEETS_SERVICE
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
 def sheet_append(sheet_name: str, row: List[Any]) -> bool:
@@ -306,12 +283,46 @@ def sheet_read_range(sheet_name: str, a1: str) -> List[List[str]]:
         return []
 
 
-# =========================
-# Settings: 公休 / 不出貨日（cached）
-# =========================
-_SETTINGS_CACHE: Dict[str, Any] = {"at": 0, "value": None}
+def sheet_update_range(sheet_name: str, a1: str, values: List[List[Any]]) -> bool:
+    """
+    values: [[...]] 二維
+    """
+    service = get_sheets_service()
+    if not service or not GSHEET_ID:
+        return False
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=GSHEET_ID,
+            range=f"'{sheet_name}'!{a1}",
+            valueInputOption="RAW",
+            body={"values": values},
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"[ERROR] update range failed {sheet_name} {a1}:", e)
+        return False
 
 
+def find_row_by_order_id(sheet_name: str, order_id: str, col_idx_1based: int, max_rows: int = 5000) -> Optional[int]:
+    """
+    回傳「資料列」的 row number（1-based）
+    col_idx_1based：在哪一欄找 order_id（例如 A表 order_id 在 D=4）
+    """
+    col_letter = chr(ord('A') + (col_idx_1based - 1))
+    rows = sheet_read_range(sheet_name, f"{col_letter}1:{col_letter}{max_rows}")
+    if not rows:
+        return None
+    # rows[0] 可能是 header，也可能不是；保守：全掃
+    for i, r in enumerate(rows, start=1):
+        v = (r[0] if r else "").strip()
+        if v == order_id:
+            return i
+    return None
+
+
+# =========================
+# Settings: 公休 / 不出貨日
+# =========================
 def parse_int_list(s: str) -> List[int]:
     out = []
     for x in (s or "").split(","):
@@ -335,14 +346,9 @@ def parse_date_set(s: str) -> set:
     return out
 
 
-def load_settings(force: bool = False) -> Dict[str, Any]:
-    # 快取 60 秒，避免每次點按鈕都去讀 sheet（容易造成「沒反應」）
-    now = time.time()
-    if (not force) and _SETTINGS_CACHE["value"] and (now - _SETTINGS_CACHE["at"] < 60):
-        return _SETTINGS_CACHE["value"]
-
+def load_settings() -> Dict[str, Any]:
     settings = {
-        "closed_weekdays": parse_int_list(ENV_CLOSED_WEEKDAYS),  # 週二=2
+        "closed_weekdays": parse_int_list(ENV_CLOSED_WEEKDAYS),  # user style 週二=2
         "closed_dates": parse_date_set(ENV_CLOSED_DATES),
         "min_days": MIN_DAYS,
         "max_days": MAX_DAYS,
@@ -364,24 +370,22 @@ def load_settings(force: bool = False) -> Dict[str, Any]:
                     settings["closed_dates"] = parse_date_set(v)
                 elif k == "min_days":
                     try:
-                        settings["min_days"] = int(v)
+                        settings["min_days"] = int(re.findall(r"\d+", v)[0])
                     except:
                         pass
                 elif k == "max_days":
                     try:
-                        settings["max_days"] = int(v)
+                        settings["max_days"] = int(re.findall(r"\d+", v)[0])
                     except:
                         pass
     except Exception as e:
         print("[INFO] settings sheet not loaded, use ENV:", e)
 
-    _SETTINGS_CACHE["at"] = now
-    _SETTINGS_CACHE["value"] = settings
     return settings
 
 
 def weekday_user_to_py(wd: int) -> int:
-    # 1..7 -> 0..6 (Mon=0)
+    # 你習慣：週二=2 -> python weekday: Mon=0
     if 1 <= wd <= 7:
         return wd - 1
     return wd
@@ -466,48 +470,16 @@ def is_phone_digits(s: str) -> bool:
     return s.isdigit() and 8 <= len(s) <= 10
 
 
-def reset_session(sess: dict):
-    sess["ordering"] = False
-    sess["state"] = "IDLE"
-    sess["cart"] = []
-    sess["pending_item"] = None
-    sess["pending_flavor"] = None
-
-    sess["pickup_method"] = None
-    sess["pickup_date"] = None
-    sess["pickup_time"] = None
-    sess["pickup_name"] = None
-    sess["pickup_phone"] = None
-    sess["pickup_phone_ok"] = False
-
-    sess["delivery_date"] = None
-    sess["delivery_name"] = None
-    sess["delivery_phone"] = None
-    sess["delivery_phone_ok"] = False
-    sess["delivery_address"] = None
-
-    sess["edit_mode"] = None
-
-
 # =========================
-# Flex builders (pure color style)
+# Flex builders (純色系、字體一致、金額不截斷)
 # =========================
-def bubble_style() -> dict:
-    return {"body": {"backgroundColor": COLOR_BG}}
-
-
 def flex_home_hint() -> dict:
     return {
         "type": "bubble",
-        "styles": bubble_style(),
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
-            "contents": [
-                {"type": "text", "text": "UooUoo 甜點訂購", "weight": "bold", "size": "xl"},
-                {"type": "text", "text": "• 點「甜點」只看菜單\n• 點「我要下單」才會開始輸入資料與下訂",
-                 "wrap": True, "size": "sm", "color": COLOR_TEXT_DIM},
-            ]
-        }
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": "UooUoo 甜點訂購", "weight": "bold", "size": "xl"},
+            {"type": "text", "text": "• 點「甜點」只看菜單\n• 點「我要下單」才會開始下訂流程", "wrap": True, "size": "sm", "color": "#666666"},
+        ]}
     }
 
 
@@ -515,25 +487,20 @@ def flex_menu_view_only() -> dict:
     rows = []
     for _, meta in ITEMS.items():
         rows.append({
-            "type": "box", "layout": "horizontal",
-            "contents": [
-                {"type": "text", "text": meta["label"], "flex": 7, "wrap": True},
-                {"type": "text", "text": f"NT${meta['unit_price']}", "flex": 3, "align": "end", "color": COLOR_TEXT_DIM},
+            "type": "box", "layout": "horizontal", "contents": [
+                {"type": "text", "text": meta["label"], "flex": 7, "wrap": True, "size": "sm"},
+                {"type": "text", "text": f"NT${meta['unit_price']}", "flex": 3, "align": "end", "color": "#666666", "size": "sm"},
             ]
         })
     return {
         "type": "bubble",
         "size": "mega",
-        "styles": bubble_style(),
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
-            "contents": [
-                {"type": "text", "text": "甜點菜單", "weight": "bold", "size": "xl"},
-                {"type": "text", "text": "（點「我要下單」才會開始下訂流程）", "size": "sm", "color": COLOR_TEXT_DIM, "wrap": True},
-                {"type": "separator"},
-                *rows,
-            ]
-        }
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": "甜點菜單", "weight": "bold", "size": "xl"},
+            {"type": "text", "text": "（點「我要下單」才會開始下訂流程）", "size": "sm", "color": "#666666", "wrap": True},
+            {"type": "separator"},
+            *rows,
+        ]}
     }
 
 
@@ -542,7 +509,6 @@ def flex_product_menu(ordering: bool) -> dict:
         return {
             "type": "button",
             "style": "primary" if enabled else "secondary",
-            "color": COLOR_PRIMARY_BTN if enabled else COLOR_SECONDARY_BTN,
             "action": {"type": "postback", "label": label, "data": data, "displayText": label},
             "height": "sm",
         }
@@ -551,49 +517,29 @@ def flex_product_menu(ordering: bool) -> dict:
     return {
         "type": "bubble",
         "size": "mega",
-        "styles": bubble_style(),
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
-            "contents": [
-                {"type": "text", "text": "請選擇商品", "weight": "bold", "size": "xl"},
-                {"type": "text", "text": "（全部甜點需提前 3 天預訂）", "size": "sm", "color": COLOR_TEXT_DIM},
-                btn("達克瓦茲｜NT$95", "PB:ITEM:dacquoise", enabled=not disable),
-                btn("原味司康｜NT$65", "PB:ITEM:scone", enabled=not disable),
-                btn("可麗露 6顆/盒｜NT$490", "PB:ITEM:canele6", enabled=not disable),
-                btn("伊思尼奶酥厚片｜NT$85", "PB:ITEM:toast", enabled=not disable),
-                {"type": "separator", "margin": "lg"},
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "color": COLOR_SECONDARY_BTN,
-                    "action": {"type": "postback", "label": "🧾 前往結帳", "data": "PB:CHECKOUT", "displayText": "前往結帳"},
-                },
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "color": COLOR_SECONDARY_BTN,
-                    "action": {"type": "postback", "label": "🗑 清空重來", "data": "PB:RESET", "displayText": "清空重來"},
-                },
-            ],
-        },
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": "請選擇商品", "weight": "bold", "size": "xl"},
+            {"type": "text", "text": "（全部甜點需提前 3 天預訂）", "size": "sm", "color": "#666666", "wrap": True},
+            btn("達克瓦茲｜NT$95", "PB:ITEM:dacquoise", enabled=not disable),
+            btn("原味司康｜NT$65", "PB:ITEM:scone", enabled=not disable),
+            btn("可麗露 6顆/盒｜NT$490", "PB:ITEM:canele6", enabled=not disable),
+            btn("伊思尼奶酥厚片｜NT$85", "PB:ITEM:toast", enabled=not disable),
+            {"type": "separator", "margin": "lg"},
+            {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "🧾 前往結帳", "data": "PB:CHECKOUT", "displayText": "前往結帳"}},
+            {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "🗑 清空重來", "data": "PB:RESET", "displayText": "清空重來"}},
+        ]}
     }
 
 
 def flex_pickup_method() -> dict:
     return {
         "type": "bubble",
-        "styles": bubble_style(),
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
-            "contents": [
-                {"type": "text", "text": "請選擇店取或宅配", "weight": "bold", "size": "xl"},
-                {"type": "text", "text": "（日期會排除公休/不出貨日）", "size": "sm", "color": COLOR_TEXT_DIM},
-                {"type": "button", "style": "primary", "color": COLOR_PRIMARY_BTN,
-                 "action": {"type": "postback", "label": "🏪 店取", "data": "PB:PICKUP:店取", "displayText": "店取"}},
-                {"type": "button", "style": "primary", "color": COLOR_PRIMARY_BTN,
-                 "action": {"type": "postback", "label": "🚚 冷凍宅配", "data": "PB:PICKUP:宅配", "displayText": "冷凍宅配"}},
-            ]
-        }
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": "請選擇店取或宅配", "weight": "bold", "size": "xl"},
+            {"type": "text", "text": "（日期會排除公休/不出貨日）", "size": "sm", "color": "#666666", "wrap": True},
+            {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🏪 店取", "data": "PB:PICKUP:店取", "displayText": "店取"}},
+            {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🚚 冷凍宅配", "data": "PB:PICKUP:宅配", "displayText": "冷凍宅配"}},
+        ]}
     }
 
 
@@ -602,24 +548,15 @@ def flex_phone_confirm(phone: str, kind: str) -> dict:
     retry_data = f"PB:PHONE_RETRY:{kind}"
     return {
         "type": "bubble",
-        "styles": bubble_style(),
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
-            "contents": [
-                {"type": "text", "text": "電話二次確認", "weight": "bold", "size": "xl"},
-                {"type": "text", "text": f"你填的電話：{phone}", "size": "md", "wrap": True},
-                {"type": "text", "text": "請確認電話正確，避免通知不到你。", "size": "sm", "color": COLOR_TEXT_DIM, "wrap": True},
-            ]
-        },
-        "footer": {
-            "type": "box", "layout": "vertical", "spacing": "sm",
-            "contents": [
-                {"type": "button", "style": "primary", "color": COLOR_PRIMARY_BTN,
-                 "action": {"type": "postback", "label": "✅ 正確", "data": ok_data, "displayText": "電話正確"}},
-                {"type": "button", "style": "secondary", "color": COLOR_SECONDARY_BTN,
-                 "action": {"type": "postback", "label": "✏️ 重新輸入", "data": retry_data, "displayText": "重新輸入電話"}},
-            ]
-        }
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": "電話二次確認", "weight": "bold", "size": "xl"},
+            {"type": "text", "text": f"你填的電話：{phone}", "size": "md", "wrap": True},
+            {"type": "text", "text": "請確認電話正確，避免通知不到你。", "size": "sm", "color": "#666666", "wrap": True},
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "button", "style": "primary", "action": {"type": "postback", "label": "✅ 正確", "data": ok_data, "displayText": "電話正確"}},
+            {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "✏️ 重新輸入", "data": retry_data, "displayText": "重新輸入電話"}},
+        ]}
     }
 
 
@@ -630,113 +567,75 @@ def flex_checkout_summary(sess: dict) -> dict:
 
     method = sess.get("pickup_method") or "（未選）"
 
+    date_show = "（未選）"
+    time_show = "（未選）"
+    fee = 0
+    grand = total
+
     if method == "宅配":
         fee = shipping_fee(total)
         grand = total + fee
         date_show = sess.get("delivery_date") or "（未選）"
         time_show = "—"
     elif method == "店取":
-        fee = 0
-        grand = total
         date_show = sess.get("pickup_date") or "（未選）"
         time_show = sess.get("pickup_time") or "（未選）"
-    else:
-        fee = 0
-        grand = total
-        date_show = "（未選）"
-        time_show = "（未選）"
 
     shown = lines[:10]
     if len(lines) > 10:
         shown.append(f"…等 {len(lines)} 項（請先刪減購物車）")
 
-    item_lines = [{"type": "text", "text": f"• {s}", "wrap": True, "size": "sm"} for s in shown] if shown else []
+    list_text = "\n".join([f"• {s}" for s in shown]) if shown else "（購物車是空的）"
 
-    # 重點：這裡用 *(...) 避免你 Render 的 SyntaxError
+    amount_blocks = [
+        {"type": "text", "text": f"小計：NT${total}", "weight": "bold", "size": "lg", "wrap": True},
+    ]
+    if method == "宅配":
+        amount_blocks.append({"type": "text", "text": f"運費：NT${fee}", "weight": "bold", "size": "lg", "wrap": True})
+        amount_blocks.append({"type": "text", "text": f"應付：NT${grand}", "weight": "bold", "size": "xl", "wrap": True})
+
     return {
         "type": "bubble",
         "size": "mega",
-        "styles": bubble_style(),
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
-            "contents": [
-                {"type": "text", "text": "🧾 結帳內容", "weight": "bold", "size": "xl"},
-                *(item_lines if item_lines else [{"type": "text", "text": "（購物車是空的）", "size": "sm", "color": COLOR_TEXT_DIM, "wrap": True}]),
-                {"type": "separator", "margin": "md"},
-                {"type": "text", "text": f"取貨方式：{method}", "size": "sm", "color": COLOR_TEXT_DIM, "wrap": True},
-                {"type": "text", "text": f"日期：{date_show}", "size": "sm", "color": COLOR_TEXT_DIM, "wrap": True},
-                {"type": "text", "text": f"時段：{time_show}", "size": "sm", "color": COLOR_TEXT_DIM, "wrap": True},
-                {"type": "separator", "margin": "md"},
-                # 金額分行，避免 NT$... 被截斷
-                {"type": "text", "text": f"小計：NT${total}", "weight": "bold", "size": "lg", "wrap": True},
-                {"type": "text", "text": f"運費：NT${fee}", "weight": "bold", "size": "lg", "wrap": True} if method == "宅配" else {"type": "text", "text": " ", "size": "xs"},
-                {"type": "text", "text": f"應付：NT${grand}", "weight": "bold", "size": "lg", "wrap": True} if method == "宅配" else {"type": "text", "text": " ", "size": "xs"},
-            ]
-        },
-        "footer": {
-            "type": "box", "layout": "vertical", "spacing": "sm",
-            "contents": [
-                {"type": "button", "style": "primary", "color": COLOR_PRIMARY_BTN,
-                 "action": {"type": "postback", "label": "🛠 修改品項", "data": "PB:EDIT:MENU", "displayText": "修改品項"}},
-                {"type": "button", "style": "secondary", "color": COLOR_SECONDARY_BTN,
-                 "action": {"type": "postback", "label": "➕ 繼續加購", "data": "PB:CONTINUE", "displayText": "繼續加購"}},
-                {"type": "button", "style": "secondary", "color": COLOR_SECONDARY_BTN,
-                 "action": {"type": "postback", "label": "✅ 下一步", "data": "PB:NEXT", "displayText": "下一步"}},
-            ]
-        }
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": "🧾 結帳內容", "weight": "bold", "size": "xl"},
+            {"type": "text", "text": list_text, "wrap": True, "size": "sm"},
+            {"type": "separator", "margin": "md"},
+            {"type": "text", "text": f"取貨方式：{method}", "size": "sm", "color": "#666666", "wrap": True},
+            {"type": "text", "text": f"日期：{date_show}", "size": "sm", "color": "#666666", "wrap": True},
+            {"type": "text", "text": f"時段：{time_show}", "size": "sm", "color": "#666666", "wrap": True},
+            {"type": "separator", "margin": "md"},
+            *amount_blocks,
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🛠 修改品項", "data": "PB:EDIT:MENU", "displayText": "修改品項"}},
+            {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "➕ 繼續加購", "data": "PB:CONTINUE", "displayText": "繼續加購"}},
+            {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "✅ 下一步", "data": "PB:NEXT", "displayText": "下一步"}},
+        ]}
     }
 
 
-def flex_new_order_admin(order_id: str, sess: dict) -> dict:
-    # 新訂單推播給管理員（含已收款/已做好/已出貨）
-    method = sess.get("pickup_method") or ""
-    total = cart_total(sess["cart"])
-    fee = shipping_fee(total) if method == "宅配" else 0
-    grand = total + fee
-    item_preview = cart_readable_text(sess["cart"])
-
-    date_show = sess.get("pickup_date") if method == "店取" else sess.get("delivery_date")
-    time_show = sess.get("pickup_time") if method == "店取" else "—"
-
+def flex_admin_new_order(order_id: str, method: str, grand_total: int) -> dict:
+    # 新訂單通知（管理員專用）
+    paid_btn = {"type": "postback", "label": "✅ 已收款", "data": f"ADMIN:PAID:{order_id}", "displayText": "已收款"}
     if method == "店取":
-        who = f"{sess.get('pickup_name','')}｜{sess.get('pickup_phone','')}"
+        ship_btn = {"type": "postback", "label": "📣 已做好，通知取貨", "data": f"ADMIN:READY:{order_id}", "displayText": "已做好通知取貨"}
     else:
-        who = f"{sess.get('delivery_name','')}｜{sess.get('delivery_phone','')}"
-
-    buttons = [
-        {"type": "button", "style": "primary", "color": COLOR_PRIMARY_BTN,
-         "action": {"type": "postback", "label": "💰 已收款", "data": f"ADMIN:PAID:{order_id}", "displayText": "已收款"}},
-    ]
-
-    if method == "店取":
-        buttons.append({"type": "button", "style": "secondary", "color": COLOR_SECONDARY_BTN,
-                        "action": {"type": "postback", "label": "📣 已做好，通知客人取貨", "data": f"ADMIN:READY:{order_id}", "displayText": "已做好通知"}})
-    else:
-        buttons.append({"type": "button", "style": "secondary", "color": COLOR_SECONDARY_BTN,
-                        "action": {"type": "postback", "label": "🚚 已出貨，通知客人", "data": f"ADMIN:SHIPPED:{order_id}", "displayText": "已出貨通知"}})
+        ship_btn = {"type": "postback", "label": "🚚 已出貨，通知客人", "data": f"ADMIN:SHIPPED:{order_id}", "displayText": "已出貨通知客人"}
 
     return {
         "type": "bubble",
-        "size": "mega",
-        "styles": bubble_style(),
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
-            "contents": [
-                {"type": "text", "text": "🆕 新訂單通知", "weight": "bold", "size": "xl"},
-                {"type": "text", "text": f"訂單：{order_id}", "wrap": True, "size": "md"},
-                {"type": "text", "text": f"方式：{method}", "wrap": True, "size": "sm", "color": COLOR_TEXT_DIM},
-                {"type": "text", "text": f"日期：{date_show or ''}", "wrap": True, "size": "sm", "color": COLOR_TEXT_DIM},
-                {"type": "text", "text": f"時段：{time_show}", "wrap": True, "size": "sm", "color": COLOR_TEXT_DIM},
-                {"type": "text", "text": f"客人：{who}", "wrap": True, "size": "sm", "color": COLOR_TEXT_DIM},
-                {"type": "separator"},
-                {"type": "text", "text": f"品項：{item_preview}", "wrap": True, "size": "sm"},
-                {"type": "separator"},
-                {"type": "text", "text": f"小計：NT${total}", "weight": "bold", "wrap": True},
-                {"type": "text", "text": f"運費：NT${fee}", "weight": "bold", "wrap": True} if method == "宅配" else {"type": "text", "text": " ", "size": "xs"},
-                {"type": "text", "text": f"應付：NT${grand}", "weight": "bold", "wrap": True} if method == "宅配" else {"type": "text", "text": " ", "size": "xs"},
-            ]
-        },
-        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": buttons}
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": "🆕 新訂單通知", "weight": "bold", "size": "xl"},
+            {"type": "text", "text": f"訂單：{order_id}", "wrap": True},
+            {"type": "text", "text": f"方式：{method}", "size": "sm", "color": "#666666", "wrap": True},
+            {"type": "text", "text": f"金額：NT${grand_total}", "size": "sm", "color": "#666666", "wrap": True},
+            {"type": "text", "text": "按鈕會同步更新：A(K欄) + C主表；並寫入 c_log", "size": "xs", "color": "#999999", "wrap": True},
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "button", "style": "primary", "action": paid_btn},
+            {"type": "button", "style": "secondary", "action": ship_btn},
+        ]}
     }
 
 
@@ -789,7 +688,7 @@ def build_qty_quick(min_qty: int, max_qty: int, prefix: str) -> List[dict]:
 
 
 # =========================
-# Order write: A/B/C
+# Sheet writes: A / B / C_main / C_log
 # =========================
 def write_order_A(user_id: str, order_id: str, sess: dict) -> bool:
     cart = sess["cart"]
@@ -814,10 +713,11 @@ def write_order_A(user_id: str, order_id: str, sess: dict) -> bool:
         pp = sess.get("pickup_phone") or ""
         note = f"取件人:{pn} | 電話:{pp}"
 
+    # A 表：假設你的欄位最後有 status（UNPAID）以及 transaction_note
     rowA = [
         now_str(),
         user_id,
-        "",
+        "",  # display_name
         order_id,
         json.dumps({"cart": cart}, ensure_ascii=False),
         pickup_method,
@@ -825,13 +725,18 @@ def write_order_A(user_id: str, order_id: str, sess: dict) -> bool:
         pickup_time,
         note,
         total,
-        "UNPAID",
-        cart_readable_text(cart),
+        "UNPAID",                  # ✅ A 表 K 欄（第11欄）
+        cart_readable_text(cart),  # L 欄
     ]
     return sheet_append(SHEET_A_NAME, rowA)
 
 
 def write_order_B(order_id: str, sess: dict) -> bool:
+    """
+    依你說的：B 表沒有 status，且 J 欄是 pickup-time。
+    因此：這裡只寫「品項明細」核心欄位，不再硬塞 UNPAID。
+    如果你 B 表目前欄位更多（例如 phone 在後面），你可以在 rowB 後面自行加欄位。
+    """
     ok_all = True
     created_at = now_str()
     pickup_method = sess.get("pickup_method") or ""
@@ -848,57 +753,123 @@ def write_order_B(order_id: str, sess: dict) -> bool:
         item_name = it["label"]
         if (it.get("flavor") or "").strip():
             item_name = f"{item_name}｜{it['flavor']}"
+
+        # 基本 9 欄：你可依你的 B 表實際欄位調整
         rowB = [
-            created_at,
-            order_id,
-            item_name,
-            it["qty"],
-            it["unit_price"],
-            it["subtotal"],
-            pickup_method,
-            pickup_date,
-            pickup_time,
-            "UNPAID",
-            phone or "",
+            created_at,      # A
+            order_id,        # B
+            item_name,       # C
+            it["qty"],       # D
+            it["unit_price"],# E
+            it["subtotal"],  # F
+            pickup_method,   # G
+            pickup_date,     # H
+            pickup_time,     # I  （你說 J 是 pickup-time，表示你表可能有一欄在前面；若是這樣你把 rowB 補一欄空字串在 pickup_time 前即可）
+            phone or "",     # J（如果你真的是 J=pickup-time，請把這個 phone 移到後面）
         ]
         ok = sheet_append(SHEET_B_NAME, rowB)
         ok_all = ok_all and ok
+
     return ok_all
 
 
-def write_order_C(order_id: str, sess: dict) -> bool:
+def c_upsert_order_status(order_id: str, sess: dict, pay_status: str, fulfillment_status: str) -> bool:
+    """
+    C 主表：一單一列（用 order_id 找到就更新；找不到就 append）
+    欄位（建議你 C 表第一列放 header，順序可不同，但這版用「固定欄位順序」寫入）
+    """
     created_at = now_str()
     pickup_method = sess.get("pickup_method") or ""
     amount = cart_total(sess["cart"])
     fee = shipping_fee(amount) if pickup_method == "宅配" else 0
     grand = amount + fee
 
-    if pickup_method == "店取":
-        note = f"店取 {sess.get('pickup_date','')} {sess.get('pickup_time','')} | {sess.get('pickup_name','')} | {sess.get('pickup_phone','')}"
-    else:
-        note = f"宅配 期望到貨:{sess.get('delivery_date','')} | {sess.get('delivery_name','')} | {sess.get('delivery_phone','')}"
+    customer_name = sess.get("pickup_name") if pickup_method == "店取" else sess.get("delivery_name")
+    phone = sess.get("pickup_phone") if pickup_method == "店取" else sess.get("delivery_phone")
+    date_ = sess.get("pickup_date") if pickup_method == "店取" else sess.get("delivery_date")
+    time_ = sess.get("pickup_time") if pickup_method == "店取" else ""
 
-    rowC = [
-        created_at,
-        order_id,
-        "ORDER",
-        pickup_method,
-        amount,
-        fee,
-        grand,
-        "ORDER",
-        note,
+    note = cart_readable_text(sess["cart"])
+
+    # 先找是否已存在（假設 C 的 order_id 在 B 欄=2；你若不同再改 col_idx_1based）
+    # 這邊我們把 order_id 放在 B（第2欄）是最常見做法：A=created_at, B=order_id...
+    row_num = find_row_by_order_id(SHEET_C_NAME, order_id, col_idx_1based=2, max_rows=5000)
+
+    row = [
+        created_at,          # A created_at
+        order_id,            # B order_id
+        pickup_method,       # C
+        customer_name or "", # D
+        phone or "",         # E
+        date_ or "",         # F
+        time_ or "",         # G
+        amount,              # H
+        fee,                 # I
+        grand,               # J
+        pay_status,          # K
+        fulfillment_status,  # L
+        "",                  # M paid_at (可空，按已收款會補)
+        "",                  # N fulfilled_at (可空，按已做好/已出貨會補)
+        created_at,          # O last_update_at
+        note,                # P note
     ]
-    return sheet_append(SHEET_C_NAME, rowC)
+
+    if row_num:
+        # 更新整列 A~P
+        return sheet_update_range(SHEET_C_NAME, f"A{row_num}:P{row_num}", [row])
+    else:
+        return sheet_append(SHEET_C_NAME, row)
 
 
-def write_status_C(order_id: str, status: str, note: str) -> bool:
-    row = [now_str(), order_id, "STATUS", "", "", "", "", status, note]
-    return sheet_append(SHEET_C_NAME, row)
+def c_update_fields(order_id: str, updates: Dict[str, Any]) -> bool:
+    """
+    更新 C 主表指定欄位（用 row 方式更新，避免複雜 header mapping）
+    這版固定 C 欄位：
+      B=order_id, K=pay_status, L=fulfillment_status, M=paid_at, N=fulfilled_at, O=last_update_at
+    """
+    row_num = find_row_by_order_id(SHEET_C_NAME, order_id, col_idx_1based=2, max_rows=5000)
+    if not row_num:
+        return False
+
+    ok = True
+    now_ = now_str()
+
+    # last_update_at -> O
+    ok = sheet_update_range(SHEET_C_NAME, f"O{row_num}:O{row_num}", [[now_]]) and ok
+
+    if "pay_status" in updates:
+        ok = sheet_update_range(SHEET_C_NAME, f"K{row_num}:K{row_num}", [[updates["pay_status"]]]) and ok
+        if updates["pay_status"] == "PAID":
+            ok = sheet_update_range(SHEET_C_NAME, f"M{row_num}:M{row_num}", [[now_]]) and ok
+
+    if "fulfillment_status" in updates:
+        ok = sheet_update_range(SHEET_C_NAME, f"L{row_num}:L{row_num}", [[updates["fulfillment_status"]]]) and ok
+        if updates["fulfillment_status"] in ["READY", "SHIPPED"]:
+            ok = sheet_update_range(SHEET_C_NAME, f"N{row_num}:N{row_num}", [[now_]]) and ok
+
+    return ok
+
+
+def c_log_append(order_id: str, action: str, note: str, operator_user_id: str) -> bool:
+    # C_log：事件紀錄（一直 append）
+    row = [now_str(), order_id, action, note, operator_user_id]
+    return sheet_append(SHEET_C_LOG_NAME, row)
+
+
+def a_update_status(order_id: str, status: str) -> bool:
+    """
+    A 表：你指定 status 在 K 欄（第11欄），order_id 在 D 欄（第4欄）
+    """
+    row_num = find_row_by_order_id(SHEET_A_NAME, order_id, col_idx_1based=4, max_rows=5000)
+    if not row_num:
+        return False
+    # K 欄
+    return sheet_update_range(SHEET_A_NAME, f"K{row_num}:K{row_num}", [[status]])
 
 
 def find_user_id_by_order_id(order_id: str) -> Optional[str]:
-    rows = sheet_read_range(SHEET_A_NAME, "A1:L3000")
+    # 從 A 表反查 user_id（假設 A 表 order_id 在 D）
+    rows = sheet_read_range(SHEET_A_NAME, "A1:L5000")
     if not rows or len(rows) < 2:
         return None
     for r in rows[1:]:
@@ -934,12 +905,9 @@ async def callback(request: Request):
     if not verify_line_signature(body, signature):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except Exception:
-        payload = {}
+    payload = json.loads(body.decode("utf-8"))
+    events = payload.get("events", [])
 
-    events = payload.get("events", []) or []
     for ev in events:
         try:
             handle_event(ev)
@@ -988,7 +956,7 @@ def handle_event(ev: dict):
             line_reply(reply_token, [msg_text(PICKUP_NOTICE + "\n\n" + DELIVERY_NOTICE)])
             return
 
-        if text in ["付款說明", "付款資訊"]:
+        if text == "付款說明":
             line_reply(reply_token, [msg_text(BANK_TRANSFER_TEXT)])
             return
 
@@ -1006,6 +974,29 @@ def handle_event(ev: dict):
         return
 
 
+def reset_session(sess: dict):
+    sess["ordering"] = False
+    sess["state"] = "IDLE"
+    sess["cart"] = []
+    sess["pending_item"] = None
+    sess["pending_flavor"] = None
+
+    sess["pickup_method"] = None
+    sess["pickup_date"] = None
+    sess["pickup_time"] = None
+    sess["pickup_name"] = None
+    sess["pickup_phone"] = None
+    sess["pickup_phone_ok"] = False
+
+    sess["delivery_date"] = None
+    sess["delivery_name"] = None
+    sess["delivery_phone"] = None
+    sess["delivery_phone_ok"] = False
+    sess["delivery_address"] = None
+
+    sess["edit_mode"] = None
+
+
 # =========================
 # Postback flows
 # =========================
@@ -1018,33 +1009,48 @@ def handle_postback(user_id: str, reply_token: str, data: str):
             line_reply(reply_token, [msg_text("此功能僅限商家管理員使用。")])
             return
 
-        parts = data.split(":", 2)  # ADMIN:PAID:orderid / READY / SHIPPED
+        parts = data.split(":", 2)  # ADMIN:PAID:orderid
         if len(parts) != 3:
             line_reply(reply_token, [msg_text("管理員指令格式錯誤。")])
             return
-        _, act, order_id = parts
 
+        _, act, order_id = parts
         target_user = find_user_id_by_order_id(order_id)
-        if not target_user:
-            line_reply(reply_token, [msg_text(f"找不到訂單對應客人：{order_id}")])
-            return
 
         if act == "PAID":
-            line_push(target_user, [msg_text(f"✅ 已收到款項，訂單將依序安排製作與出貨/取貨。\n訂單編號：{order_id}")])
-            write_status_C(order_id, "PAID", "已收款")
-            line_reply(reply_token, [msg_text("已標記收款（PAID），並寫入 C 表、通知客人。")])
+            # 1) 更新 A(K) -> PAID
+            okA = a_update_status(order_id, "PAID")
+            # 2) 更新 C 主表 pay_status
+            okC = c_update_fields(order_id, {"pay_status": "PAID"})
+            # 3) 寫入 c_log
+            c_log_append(order_id, "PAID", "管理員已收款", user_id)
+
+            if target_user:
+                line_push(target_user, [msg_text(f"我們已收到你的款項，訂單將依排程製作。\n訂單編號：{order_id}")])
+
+            line_reply(reply_token, [msg_text(f"✅ 已收款：{order_id}\nA(K)=PAID：{'OK' if okA else 'FAIL'}\nC=PAID：{'OK' if okC else 'FAIL'}")])
             return
 
         if act == "READY":
-            line_push(target_user, [msg_text(f"你的訂單已完成，可以來取貨了。\n訂單編號：{order_id}\n如需更改取貨時間請回覆訊息。")])
-            write_status_C(order_id, "READY", "店取已做好通知")
-            line_reply(reply_token, [msg_text("已通知客人（READY），並寫入 C 表。")])
+            okA = a_update_status(order_id, "READY")
+            okC = c_update_fields(order_id, {"fulfillment_status": "READY"})
+            c_log_append(order_id, "READY", "店取已做好並通知", user_id)
+
+            if target_user:
+                line_push(target_user, [msg_text(f"你的訂單已完成，可以來取貨了。\n訂單編號：{order_id}\n如需更改取貨時間請回覆訊息。")])
+
+            line_reply(reply_token, [msg_text(f"✅ 已做好並通知：{order_id}\nA(K)=READY：{'OK' if okA else 'FAIL'}\nC=READY：{'OK' if okC else 'FAIL'}")])
             return
 
         if act == "SHIPPED":
-            line_push(target_user, [msg_text(f"你的訂單已出貨。\n訂單編號：{order_id}\n提醒：運送可能因天候/物流量延遲。")])
-            write_status_C(order_id, "SHIPPED", "宅配已出貨通知")
-            line_reply(reply_token, [msg_text("已通知客人（SHIPPED），並寫入 C 表。")])
+            okA = a_update_status(order_id, "SHIPPED")
+            okC = c_update_fields(order_id, {"fulfillment_status": "SHIPPED"})
+            c_log_append(order_id, "SHIPPED", "宅配已出貨並通知", user_id)
+
+            if target_user:
+                line_push(target_user, [msg_text(f"你的訂單已出貨。\n訂單編號：{order_id}\n提醒：運送可能因天候/物流量延遲。")])
+
+            line_reply(reply_token, [msg_text(f"✅ 已出貨並通知：{order_id}\nA(K)=SHIPPED：{'OK' if okA else 'FAIL'}\nC=SHIPPED：{'OK' if okC else 'FAIL'}")])
             return
 
         line_reply(reply_token, [msg_text("未知的管理員動作。")])
@@ -1056,7 +1062,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_text("已清空。\n請點「我要下單」開始，或點「甜點」先看菜單。")])
         return
 
-    # CONTINUE (go menu)
+    # CONTINUE
     if data == "PB:CONTINUE":
         if not sess["ordering"]:
             line_reply(reply_token, [msg_text("請先點「我要下單」開始下單流程。")])
@@ -1064,7 +1070,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_flex("甜點菜單", flex_product_menu(ordering=True))])
         return
 
-    # CHECKOUT entry
+    # CHECKOUT
     if data == "PB:CHECKOUT":
         if not sess["ordering"]:
             line_reply(reply_token, [msg_text("請先點「我要下單」開始下單流程。")])
@@ -1072,6 +1078,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         if not sess["cart"]:
             line_reply(reply_token, [msg_text("購物車是空的，請先選商品。"), msg_flex("甜點菜單", flex_product_menu(ordering=True))])
             return
+
         sess["state"] = "WAIT_PICKUP_METHOD"
         line_reply(reply_token, [msg_flex("取貨方式", flex_pickup_method())])
         return
@@ -1154,7 +1161,6 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         if not date_buttons:
             line_reply(reply_token, [msg_text("近期可選日期不足（可能都遇到公休/不出貨日）。請調整公休日設定後再試。")])
             return
-
         quick_items = [quick_postback(lbl, f"PB:DATE:{ymd}", display_text=lbl) for (lbl, ymd) in date_buttons]
 
         if method == "店取":
@@ -1164,7 +1170,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
 
         if method == "宅配":
             sess["state"] = "WAIT_DELIVERY_DATE"
-            line_reply(reply_token, [msg_text("請選「期望到貨日」（3～14天內；不保證準時，僅作期望日；已排除公休）：", quick_items=quick_items)])
+            line_reply(reply_token, [msg_text("請選「期望到貨日」（3～14天內；不保證準時；已排除公休）：", quick_items=quick_items)])
             return
 
     # DATE
@@ -1249,6 +1255,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_text("請選要修改的方式：", quick_items=q)])
         return
 
+    # EDITMODE
     if data.startswith("PB:EDITMODE:"):
         mode = data.split("PB:EDITMODE:", 1)[1].strip()
         sess["edit_mode"] = mode
@@ -1257,6 +1264,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_text("請選要修改的品項：", quick_items=q)])
         return
 
+    # EDIT apply
     if data.startswith("PB:EDIT:"):
         parts = data.split(":")
         if len(parts) != 4:
@@ -1288,7 +1296,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
                 return
             sess["state"] = "WAIT_EDIT_FLAVOR"
             sess["pending_item"] = item_key
-            sess["pending_flavor"] = idx  # 暫存 idx
+            sess["pending_flavor"] = idx
             q = [quick_postback(f, f"PB:SETFLAVOR:{f}", display_text=f) for f in ITEMS[item_key]["flavors"]]
             line_reply(reply_token, [msg_text("請選新口味：", quick_items=q)])
             return
@@ -1307,6 +1315,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_text("✅ 已更新結帳內容"), msg_flex("結帳內容", flex_checkout_summary(sess))])
         return
 
+    # SETFLAVOR
     if data.startswith("PB:SETFLAVOR:") and sess.get("state") == "WAIT_EDIT_FLAVOR":
         new_flavor = data.split("PB:SETFLAVOR:", 1)[1].strip()
         idx = sess.get("pending_flavor")
@@ -1335,7 +1344,8 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         if sess["pickup_method"] == "店取":
             if not sess.get("pickup_date"):
                 sess["state"] = "WAIT_PICKUP_DATE"
-                date_buttons = build_available_date_buttons(load_settings())
+                settings = load_settings()
+                date_buttons = build_available_date_buttons(settings)
                 q = [quick_postback(lbl, f"PB:DATE:{ymd}", display_text=lbl) for (lbl, ymd) in date_buttons]
                 line_reply(reply_token, [msg_text("請選店取日期：", quick_items=q)])
                 return
@@ -1359,7 +1369,8 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         if sess["pickup_method"] == "宅配":
             if not sess.get("delivery_date"):
                 sess["state"] = "WAIT_DELIVERY_DATE"
-                date_buttons = build_available_date_buttons(load_settings())
+                settings = load_settings()
+                date_buttons = build_available_date_buttons(settings)
                 q = [quick_postback(lbl, f"PB:DATE:{ymd}", display_text=lbl) for (lbl, ymd) in date_buttons]
                 line_reply(reply_token, [msg_text("請選期望到貨日：", quick_items=q)])
                 return
@@ -1379,15 +1390,15 @@ def handle_postback(user_id: str, reply_token: str, data: str):
                 line_reply(reply_token, [msg_text("請輸入宅配地址（完整地址）：")])
                 return
 
-        # 建單
+        # ---- 建單 + 寫 A/B/C ----
         order_id = gen_order_id()
 
         okA = write_order_A(user_id, order_id, sess)
         okB = write_order_B(order_id, sess)
-        okC = write_order_C(order_id, sess)
 
-        if not (okA and okB and okC):
-            line_reply(reply_token, [msg_text("訂單已建立，但表單寫入可能有錯誤（請檢查 Sheet 欄位與名稱）。")])
+        # C 主表：建單就 upsert 一列：pay=UNPAID, fulfill=PENDING
+        okC = c_upsert_order_status(order_id, sess, pay_status="UNPAID", fulfillment_status="PENDING")
+        c_log_append(order_id, "CREATE", "新訂單建立", user_id)
 
         total = cart_total(sess["cart"])
         fee = shipping_fee(total) if sess["pickup_method"] == "宅配" else 0
@@ -1427,11 +1438,15 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         # 回覆客人
         line_reply(reply_token, [msg_text(msg)])
 
-        # 新訂單通知給管理員（含已收款按鈕）
+        # 推播「新訂單通知＋按鈕」給管理員
         if ADMIN_USER_IDS:
-            admin_card = msg_flex("新訂單通知", flex_new_order_admin(order_id, sess))
+            admin_card = msg_flex("新訂單通知", flex_admin_new_order(order_id, sess["pickup_method"], grand))
             for admin_uid in ADMIN_USER_IDS:
                 line_push(admin_uid, [admin_card])
+
+        if not (okA and okB and okC):
+            # 這個訊息避免打擾客人；只在 server log 留著
+            print("[WARN] sheet write not all ok:", okA, okB, okC)
 
         reset_session(sess)
         return
@@ -1450,12 +1465,14 @@ def handle_state_text(user_id: str, reply_token: str, text: str):
         line_reply(reply_token, [msg_flex("提示", flex_home_hint())])
         return
 
+    # 店取姓名
     if sess["state"] == "WAIT_PICKUP_NAME":
         sess["pickup_name"] = text.strip()
         sess["state"] = "WAIT_PICKUP_PHONE"
         line_reply(reply_token, [msg_text("請輸入店取電話（純數字）：")])
         return
 
+    # 店取電話
     if sess["state"] == "WAIT_PICKUP_PHONE":
         if not is_phone_digits(text):
             line_reply(reply_token, [msg_text("電話格式看起來不對，請輸入純數字（例如 09xxxxxxxx）。")])
@@ -1469,12 +1486,14 @@ def handle_state_text(user_id: str, reply_token: str, text: str):
         ])
         return
 
+    # 宅配姓名
     if sess["state"] == "WAIT_DELIVERY_NAME":
         sess["delivery_name"] = text.strip()
         sess["state"] = "WAIT_DELIVERY_PHONE"
         line_reply(reply_token, [msg_text("請輸入宅配電話（純數字）：")])
         return
 
+    # 宅配電話
     if sess["state"] == "WAIT_DELIVERY_PHONE":
         if not is_phone_digits(text):
             line_reply(reply_token, [msg_text("電話格式看起來不對，請輸入純數字（例如 09xxxxxxxx）。")])
@@ -1488,6 +1507,7 @@ def handle_state_text(user_id: str, reply_token: str, text: str):
         ])
         return
 
+    # 宅配地址
     if sess["state"] == "WAIT_DELIVERY_ADDRESS":
         sess["delivery_address"] = text.strip()
         sess["state"] = "IDLE"
