@@ -1,11 +1,4 @@
-# main.py
-# UooUoo Cafe LINE Order Bot (FastAPI) - Stable Full Version (Sheets + Calendar + Full Order Flow)
-# - Google Sheets: A (orders), B (items/details), C (status log), c_log (raw log)
-# - Optional Google Calendar event creation (service account)
-# - Removes customer-facing debug messages
-# - Prevents duplicate webhook deliveries and double-writes
-# - Settings sheet is OPTIONAL: if missing/invalid, system falls back to ENV/defaults and still runs
-
+# main.py (Ultra-stable / anti-failed version)
 from __future__ import annotations
 
 import base64
@@ -19,51 +12,44 @@ import threading
 import time
 import traceback
 import uuid
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-# Google APIs
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# =============================================================================
-# App
-# =============================================================================
 
+# =============================================================================
+# Basic App
+# =============================================================================
 app = FastAPI()
 
 # =============================================================================
-# Environment / Config
+# ENV
 # =============================================================================
+CHANNEL_ACCESS_TOKEN = (os.getenv("CHANNEL_ACCESS_TOKEN") or "").strip()
+CHANNEL_SECRET = (os.getenv("CHANNEL_SECRET") or "").strip()
 
-CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN", "").strip()
-CHANNEL_SECRET = os.getenv("CHANNEL_SECRET", "").strip()
+GSHEET_ID = (os.getenv("GSHEET_ID") or "").strip()
 
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-ADMIN_USER_IDS = [x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()]
+# Service account b64 (json)
+GOOGLE_SERVICE_ACCOUNT_B64 = (os.getenv("GOOGLE_SERVICE_ACCOUNT_B64") or "").strip()
 
-# Sheets
-GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
+# Sheets names (best effort)
+SHEET_A_NAME = (os.getenv("SHEET_A_NAME") or os.getenv("GSHEET_SHEET_NAME") or "orders").strip()
+SHEET_B_NAME = (os.getenv("SHEET_B_NAME") or os.getenv("GSHEET_TAB") or "orders_items").strip()
+SHEET_C_NAME = (os.getenv("SHEET_C_NAME") or "C").strip()
+SHEET_CLOG_NAME = (os.getenv("SHEET_CLOG_NAME") or os.getenv("SHEET_C_LOG_NAME") or "c_log").strip()
+SHEET_ITEMS_NAME = (os.getenv("SHEET_ITEMS_NAME") or "items").strip()
 
-# Preferred: explicit sheet/tab names
-SHEET_SETTINGS_NAME = os.getenv("SHEET_SETTINGS_NAME", "settings").strip()
-SHEET_ITEMS_NAME = os.getenv("SHEET_ITEMS_NAME", "items").strip()
-SHEET_C_NAME = os.getenv("SHEET_C_NAME", "C").strip()
-SHEET_CASHFLOW_NAME = os.getenv("SHEET_CASHFLOW_NAME", "cashflow").strip()
+BANK_NAME = (os.getenv("BANK_NAME") or "").strip()
+BANK_CORE = (os.getenv("BANK_CORE") or "").strip()
+BANK_ACCOUNT = (os.getenv("BANK_ACCOUNT") or "").strip()
+STORE_ADDRESS = (os.getenv("STORE_ADDRESS") or "").strip()
 
-# A (orders summary) and B (items detail)
-SHEET_A_NAME = os.getenv("SHEET_A_NAME", "orders").strip()
-SHEET_B_NAME = os.getenv("SHEET_B_NAME", "orders_items").strip()
-
-# C log sheets
-SHEET_CLOG_NAME = os.getenv("SHEET_CLOG_NAME", "c_log").strip()   # raw event/order log
-SHEET_C_LOG_NAME = os.getenv("SHEET_C_LOG_NAME", SHEET_CLOG_NAME).strip()  # compatibility
-
-# Business rules - env fallback
 def _safe_int_env(key: str, default: int) -> int:
     raw = os.getenv(key, "")
     if raw is None:
@@ -77,126 +63,32 @@ def _safe_int_env(key: str, default: int) -> int:
     except Exception:
         return default
 
-MIN_DAYS_ENV = _safe_int_env("MIN_DAYS", 3)
-MAX_DAYS_ENV = _safe_int_env("MAX_DAYS", 14)
-ORDER_CUTOFF_HOURS = _safe_int_env("ORDER_CUTOFF_HOURS", 0)
+MIN_DAYS = _safe_int_env("MIN_DAYS", 3)
+MAX_DAYS = _safe_int_env("MAX_DAYS", 14)
 
-CLOSED_DATES_RAW = os.getenv("CLOSED_DATES", "").strip()           # e.g. "2026-01-01,2026-01-02"
-CLOSED_WEEKDAYS_RAW = os.getenv("CLOSED_WEEKDAYS", "").strip()     # e.g. "2" or "2,3" (Mon=0)
+CLOSED_DATES_RAW = (os.getenv("CLOSED_DATES") or "").strip()
+CLOSED_WEEKDAYS_RAW = (os.getenv("CLOSED_WEEKDAYS") or "").strip()
 
-STORE_ADDRESS = os.getenv("STORE_ADDRESS", "").strip()
-
-# Payment info
-BANK_NAME = os.getenv("BANK_NAME", "").strip()
-BANK_CORE = os.getenv("BANK_CORE", "").strip()
-BANK_ACCOUNT = os.getenv("BANK_ACCOUNT", "").strip()
-
-# Google Service Account (base64 json)
-GOOGLE_SERVICE_ACCOUNT_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "").strip()
-
-# Optional Calendar
-GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "").strip()
-GCAL_TIMEZONE = os.getenv("GCAL_TIMEZONE", "Asia/Taipei").strip()
-
-# Misc
-APP_ENV = os.getenv("APP_ENV", "prod").strip().lower()
 
 # =============================================================================
-# Constants / Helpers
+# Utilities
 # =============================================================================
-
-LINE_REPLY_ENDPOINT = "https://api.line.me/v2/bot/message/reply"
-LINE_PUSH_ENDPOINT = "https://api.line.me/v2/bot/message/push"
-
-SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-CAL_SCOPES = ["https://www.googleapis.com/auth/calendar"]
-
-# Webhook de-dup (LINE may resend)
-_DEDUP_LOCK = threading.Lock()
-_DEDUP_TTL_SEC = 60 * 10
-_DEDUP_MAP: Dict[str, float] = {}  # key -> expires_at
-
-
-def _now_ts() -> float:
-    return time.time()
-
-
-def _dedup_seen(key: str) -> bool:
-    """Return True if already processed recently."""
-    now = _now_ts()
-    with _DEDUP_LOCK:
-        expired = [k for k, exp in _DEDUP_MAP.items() if exp <= now]
-        for k in expired:
-            _DEDUP_MAP.pop(k, None)
-
-        if key in _DEDUP_MAP:
-            return True
-        _DEDUP_MAP[key] = now + _DEDUP_TTL_SEC
-        return False
-
-
-def _hmac_sha256(secret: str, body: bytes) -> str:
-    mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
-    return base64.b64encode(mac).decode("utf-8")
-
-
-def _verify_line_signature(body: bytes, signature: str) -> bool:
-    if not CHANNEL_SECRET or not signature:
-        return False
-    expected = _hmac_sha256(CHANNEL_SECRET, body)
-    return hmac.compare_digest(expected, signature)
-
-
-def _line_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-
-async def line_reply(reply_token: str, messages: List[Dict[str, Any]]) -> None:
-    if not reply_token:
-        return
-    payload = {"replyToken": reply_token, "messages": messages}
+def _fmt_currency(n: int) -> str:
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(LINE_REPLY_ENDPOINT, headers=_line_headers(), json=payload)
-            if r.status_code >= 400:
-                print("[LINE] reply failed:", r.status_code, r.text[:500])
-    except Exception as e:
-        print("[LINE] reply exception:", repr(e))
-
-
-async def line_push(to: str, messages: List[Dict[str, Any]]) -> None:
-    if not to:
-        return
-    payload = {"to": to, "messages": messages}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(LINE_PUSH_ENDPOINT, headers=_line_headers(), json=payload)
-            if r.status_code >= 400:
-                print("[LINE] push failed:", r.status_code, r.text[:500])
-    except Exception as e:
-        print("[LINE] push exception:", repr(e))
-
-
-def is_admin(user_id: str, token: str = "") -> bool:
-    if token and ADMIN_TOKEN and token == ADMIN_TOKEN:
-        return True
-    return user_id in ADMIN_USER_IDS
-
+        return f"NT${int(n):,}"
+    except Exception:
+        return f"NT${n}"
 
 def _parse_csv_dates(s: str) -> set[str]:
-    out: set[str] = set()
+    out = set()
     for part in (s or "").split(","):
         p = part.strip()
         if p:
             out.add(p)
     return out
 
-
 def _parse_csv_ints(s: str) -> set[int]:
-    out: set[int] = set()
+    out = set()
     for part in (s or "").split(","):
         p = part.strip()
         if not p:
@@ -207,172 +99,178 @@ def _parse_csv_ints(s: str) -> set[int]:
             pass
     return out
 
-
-CLOSED_DATES_ENV = _parse_csv_dates(CLOSED_DATES_RAW)
-CLOSED_WEEKDAYS_ENV = _parse_csv_ints(CLOSED_WEEKDAYS_RAW)  # Monday=0 .. Sunday=6
-
+CLOSED_DATES = _parse_csv_dates(CLOSED_DATES_RAW)
+CLOSED_WEEKDAYS = _parse_csv_ints(CLOSED_WEEKDAYS_RAW)  # Mon=0..Sun=6
 
 def _today_tz() -> dt.date:
-    utc = dt.datetime.utcnow()
-    local = utc + dt.timedelta(hours=8)
-    return local.date()
-
+    # fixed +8 (Taiwan)
+    return (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
 
 def _date_to_str(d: dt.date) -> str:
     return d.strftime("%Y-%m-%d")
 
+def list_available_dates() -> List[str]:
+    today = _today_tz()
+    out = []
+    for delta in range(MIN_DAYS, MAX_DAYS + 1):
+        d = today + dt.timedelta(days=delta)
+        if _date_to_str(d) in CLOSED_DATES:
+            continue
+        if d.weekday() in CLOSED_WEEKDAYS:
+            continue
+        out.append(_date_to_str(d))
+    return out
 
-def _fmt_currency(n: int) -> str:
-    try:
-        return f"NT${int(n):,}"
-    except Exception:
-        return f"NT${n}"
-
-
-def _escape_sheet_name(sheet: str) -> str:
-    sheet = (sheet or "").strip()
-    if sheet == "":
-        return sheet
-    needs_quote = bool(re.search(r"[ \[\]\(\)\-!@#$%^&*+=,./\\;:]", sheet))
-    sheet_escaped = sheet.replace("'", "''")
-    return f"'{sheet_escaped}'" if needs_quote else sheet_escaped
-
-
-def _a1(sheet: str, rng: str) -> str:
-    s = _escape_sheet_name(sheet)
-    r = (rng or "").strip()
-    if "!" in r:
-        return r
-    return f"{s}!{r}"
+def new_order_id() -> str:
+    ymd = _today_tz().strftime("%Y%m%d")
+    tail = str(uuid.uuid4().int)[-4:]
+    return f"UOO-{ymd}-{tail}"
 
 # =============================================================================
-# Google Clients
+# LINE Signature
 # =============================================================================
+def _hmac_sha256(secret: str, body: bytes) -> str:
+    mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
+    return base64.b64encode(mac).decode("utf-8")
 
+def _verify_line_signature(body: bytes, signature: str) -> bool:
+    if not CHANNEL_SECRET or not signature:
+        return False
+    expected = _hmac_sha256(CHANNEL_SECRET, body)
+    return hmac.compare_digest(expected, signature)
+
+def _line_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+LINE_REPLY_ENDPOINT = "https://api.line.me/v2/bot/message/reply"
+
+async def line_reply(reply_token: str, messages: List[Dict[str, Any]]) -> None:
+    if not reply_token:
+        return
+    payload = {"replyToken": reply_token, "messages": messages}
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(LINE_REPLY_ENDPOINT, headers=_line_headers(), json=payload)
+        if r.status_code >= 400:
+            # do NOT crash webhook
+            print("[LINE] reply failed:", r.status_code, r.text[:300])
+
+def _text_message(text: str) -> Dict[str, Any]:
+    return {"type": "text", "text": text}
+
+# =============================================================================
+# Google Clients (ultra-stable)
+# =============================================================================
 _google_lock = threading.Lock()
 _sheets_service = None
-_cal_service = None
 
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-def _load_sa_credentials(scopes: List[str]) -> Credentials:
+def _load_sa_credentials() -> Credentials:
     if not GOOGLE_SERVICE_ACCOUNT_B64:
         raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_B64")
     raw = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_B64).decode("utf-8")
     info = json.loads(raw)
-    return Credentials.from_service_account_info(info, scopes=scopes)
-
+    return Credentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
 
 def sheets_service():
     global _sheets_service
     with _google_lock:
         if _sheets_service is None:
-            creds = _load_sa_credentials(SHEETS_SCOPES)
+            creds = _load_sa_credentials()
             _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
         return _sheets_service
 
+def _escape_sheet_name(sheet: str) -> str:
+    sheet = (sheet or "").strip()
+    if not sheet:
+        return sheet
+    # Always quote for safety
+    return "'" + sheet.replace("'", "''") + "'"
 
-def cal_service():
-    global _cal_service
-    with _google_lock:
-        if _cal_service is None:
-            creds = _load_sa_credentials(CAL_SCOPES)
-            _cal_service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-        return _cal_service
-
-# =============================================================================
-# Sheets helper (header mapping + append/update)
-# =============================================================================
+def _a1(sheet: str, rng: str) -> str:
+    return f"{_escape_sheet_name(sheet)}!{rng}"
 
 class SheetRepo:
     def __init__(self, spreadsheet_id: str):
         self.sid = spreadsheet_id
 
-    def _get_values(self, range_a1: str) -> List[List[Any]]:
+    def get_values(self, sheet: str, rng: str) -> List[List[Any]]:
         svc = sheets_service()
         resp = svc.spreadsheets().values().get(
             spreadsheetId=self.sid,
-            range=range_a1,
+            range=_a1(sheet, rng),
             valueRenderOption="UNFORMATTED_VALUE",
         ).execute()
         return resp.get("values", [])
 
-    def _append_values(self, sheet: str, values: List[List[Any]], start_range: str = "A:Z") -> None:
+    def append_values(self, sheet: str, values: List[List[Any]]) -> None:
         svc = sheets_service()
-        rng = _a1(sheet, start_range)
+        # IMPORTANT: use sheet!A:ZZ so it never breaks on A1 parse
         svc.spreadsheets().values().append(
             spreadsheetId=self.sid,
-            range=rng,
+            range=_a1(sheet, "A:ZZ"),
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": values},
         ).execute()
 
-    def get_header_map(self, sheet: str, header_row: int = 1) -> Dict[str, int]:
-        rng = _a1(sheet, f"A{header_row}:ZZ{header_row}")
-        rows = self._get_values(rng)
+    def header_map(self, sheet: str) -> Dict[str, int]:
+        rows = self.get_values(sheet, "A1:ZZ1")
         if not rows:
             return {}
         header = rows[0]
-        m: Dict[str, int] = {}
-        for idx, name in enumerate(header):
-            if name is None:
+        m = {}
+        for i, h in enumerate(header):
+            if h is None:
                 continue
-            k = str(name).strip()
+            k = str(h).strip()
             if k:
-                m[k] = idx
+                m[k] = i
         return m
 
-    def append_by_header(self, sheet: str, row_dict: Dict[str, Any], header_row: int = 1) -> None:
-        hm = self.get_header_map(sheet, header_row=header_row)
+    def append_by_header(self, sheet: str, row_dict: Dict[str, Any]) -> None:
+        hm = self.header_map(sheet)
         if not hm:
-            self._append_values(sheet, [[str(v) if v is not None else "" for v in row_dict.values()]])
+            # fallback: append values only
+            self.append_values(sheet, [[str(v) if v is not None else "" for v in row_dict.values()]])
             return
-
-        max_col = max(hm.values()) if hm else -1
+        max_col = max(hm.values())
         row = [""] * (max_col + 1)
         for k, v in row_dict.items():
             if k not in hm:
                 continue
-            i = hm[k]
-            row[i] = "" if v is None else str(v)
-        self._append_values(sheet, [row], start_range="A:ZZ")
+            row[hm[k]] = "" if v is None else str(v)
+        self.append_values(sheet, [row])
 
-    def find_row_index(self, sheet: str, key_col_name: str, key_value: str, header_row: int = 1) -> Optional[int]:
-        hm = self.get_header_map(sheet, header_row=header_row)
-        if key_col_name not in hm:
+    def find_row_index(self, sheet: str, key_col: str, key_value: str) -> Optional[int]:
+        hm = self.header_map(sheet)
+        if key_col not in hm:
             return None
-        col_idx = hm[key_col_name]  # 0-based
-        col_letter = self._col_to_letter(col_idx + 1)
-        rng = _a1(sheet, f"{col_letter}{header_row+1}:{col_letter}")
-        vals = self._get_values(rng)
+        col_idx = hm[key_col] + 1  # 1-based
+        col_letter = self._col_to_letter(col_idx)
+        vals = self.get_values(sheet, f"{col_letter}2:{col_letter}")
         for i, row in enumerate(vals):
             if row and str(row[0]).strip() == str(key_value).strip():
-                return (header_row + 1) + i
+                return 2 + i
         return None
 
-    def update_cells_by_header(
-        self,
-        sheet: str,
-        row_index_1based: int,
-        updates: Dict[str, Any],
-        header_row: int = 1,
-    ) -> None:
-        hm = self.get_header_map(sheet, header_row=header_row)
+    def update_cells(self, sheet: str, row_idx: int, updates: Dict[str, Any]) -> None:
+        hm = self.header_map(sheet)
         if not hm:
             return
-
         data = []
         for k, v in updates.items():
             if k not in hm:
                 continue
             col_idx = hm[k] + 1
             col_letter = self._col_to_letter(col_idx)
-            rng = _a1(sheet, f"{col_letter}{row_index_1based}:{col_letter}{row_index_1based}")
-            data.append({"range": rng, "values": [[("" if v is None else str(v))]]})
-
+            data.append({"range": _a1(sheet, f"{col_letter}{row_idx}:{col_letter}{row_idx}"),
+                         "values": [[("" if v is None else str(v))]]})
         if not data:
             return
-
         svc = sheets_service()
         svc.spreadsheets().values().batchUpdate(
             spreadsheetId=self.sid,
@@ -381,231 +279,60 @@ class SheetRepo:
 
     @staticmethod
     def _col_to_letter(n: int) -> str:
-        letters = ""
+        s = ""
         while n:
-            n, rem = divmod(n - 1, 26)
-            letters = chr(65 + rem) + letters
-        return letters
-
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
 
 repo = SheetRepo(GSHEET_ID) if GSHEET_ID else None
 
+
 # =============================================================================
-# Settings (OPTIONAL) - SAFE / FAIL-OPEN
+# Dedup (prevents duplicate writes)
 # =============================================================================
+_DEDUP_LOCK = threading.Lock()
+_DEDUP_TTL = 600
+_DEDUP: Dict[str, float] = {}
 
-_SETTINGS_LOCK = threading.Lock()
-_SETTINGS_CACHE: Dict[str, Any] = {}
-_SETTINGS_CACHE_EXP: float = 0.0
-_SETTINGS_TTL_SEC = 60  # 1 minute cache
-
-
-def _coerce_int(v: Any, default: int) -> int:
-    m = re.search(r"-?\d+", str(v or ""))
-    if not m:
-        return default
-    try:
-        return int(m.group(0))
-    except Exception:
-        return default
-
-
-def _coerce_bool(v: Any, default: bool) -> bool:
-    s = str(v or "").strip().lower()
-    if s in ("1", "true", "y", "yes", "on"):
-        return True
-    if s in ("0", "false", "n", "no", "off"):
+def _dedup_seen(key: str) -> bool:
+    now = time.time()
+    with _DEDUP_LOCK:
+        dead = [k for k, exp in _DEDUP.items() if exp <= now]
+        for k in dead:
+            _DEDUP.pop(k, None)
+        if key in _DEDUP:
+            return True
+        _DEDUP[key] = now + _DEDUP_TTL
         return False
-    return default
 
-
-def _coerce_csv_list(v: Any) -> List[str]:
-    if not v:
-        return []
-    return [x.strip() for x in str(v).split(",") if x.strip()]
-
-
-def load_settings(force: bool = False) -> Dict[str, Any]:
-    """
-    settings sheet structure: key | value
-    This is OPTIONAL: any failure returns {} and bot still works.
-    """
-    global _SETTINGS_CACHE, _SETTINGS_CACHE_EXP
-    now = _now_ts()
-    with _SETTINGS_LOCK:
-        if (not force) and _SETTINGS_CACHE and _SETTINGS_CACHE_EXP > now:
-            return dict(_SETTINGS_CACHE)
-
-    if not repo:
-        return {}
-
-    try:
-        values = repo._get_values(_a1(SHEET_SETTINGS_NAME, "A1:B"))
-        if not values or len(values) < 2:
-            return {}
-
-        header = [str(x).strip().lower() for x in (values[0] or [])]
-        key_i = header.index("key") if "key" in header else 0
-        val_i = header.index("value") if "value" in header else 1
-
-        s: Dict[str, Any] = {}
-        for row in values[1:]:
-            if not row:
-                continue
-            k = str(row[key_i]).strip() if key_i < len(row) else ""
-            if not k:
-                continue
-            v = row[val_i] if val_i < len(row) else ""
-            s[k] = v
-
-        with _SETTINGS_LOCK:
-            _SETTINGS_CACHE = dict(s)
-            _SETTINGS_CACHE_EXP = _now_ts() + _SETTINGS_TTL_SEC
-        return s
-
-    except Exception as e:
-        print("[Sheets] load_settings failed (ignored):", repr(e))
-        return {}
-
-
-def get_setting_int(key: str, default: int) -> int:
-    try:
-        s = load_settings()
-        if key not in s:
-            return default
-        return _coerce_int(s.get(key), default)
-    except Exception:
-        return default
-
-
-def get_setting_bool(key: str, default: bool) -> bool:
-    try:
-        s = load_settings()
-        if key not in s:
-            return default
-        return _coerce_bool(s.get(key), default)
-    except Exception:
-        return default
-
-
-def get_setting_csv_list(key: str, default: List[str]) -> List[str]:
-    try:
-        s = load_settings()
-        if key not in s:
-            return default
-        xs = _coerce_csv_list(s.get(key))
-        return xs if xs else default
-    except Exception:
-        return default
 
 # =============================================================================
-# Data models
+# Items (safe)
 # =============================================================================
-
-@dataclass
-class CartItem:
-    item_id: str
-    name: str
-    unit_price: int
-    qty: int = 1
-    flavor: str = ""
-    spec: str = ""
-
-    @property
-    def subtotal(self) -> int:
-        return int(self.unit_price) * int(self.qty)
-
-
-@dataclass
-class OrderDraft:
-    user_id: str
-    display_name: str
-    order_id: str
-    pickup_method: str  # "店取" or "宅配"
-    pickup_date: str    # YYYY-MM-DD (for delivery: desired arrival date)
-    pickup_time: str    # e.g. "12:00-14:00" or "" for delivery
-    phone: str
-    receiver_name: str
-    address: str
-    items: List[CartItem]
-    shipping_fee: int = 0
-    note: str = ""
-
-    @property
-    def amount(self) -> int:
-        return sum(i.subtotal for i in self.items)
-
-    @property
-    def grand_total(self) -> int:
-        return int(self.amount) + int(self.shipping_fee)
-
-# =============================================================================
-# In-memory session store
-# =============================================================================
-
-_SESS_LOCK = threading.Lock()
-_SESS: Dict[str, Dict[str, Any]] = {}  # user_id -> session dict
-_SESS_TTL = 60 * 60  # 1 hour
-
-
-def _sess_get(user_id: str) -> Dict[str, Any]:
-    now = _now_ts()
-    with _SESS_LOCK:
-        dead = []
-        for uid, s in _SESS.items():
-            if s.get("_exp", 0) <= now:
-                dead.append(uid)
-        for uid in dead:
-            _SESS.pop(uid, None)
-
-        s = _SESS.get(user_id)
-        if not s:
-            s = {"_exp": now + _SESS_TTL}
-            _SESS[user_id] = s
-        else:
-            s["_exp"] = now + _SESS_TTL
-        return s
-
-
-def _cart_clear(user_id: str) -> None:
-    with _SESS_LOCK:
-        if user_id in _SESS:
-            _SESS[user_id]["cart"] = []
-
-# =============================================================================
-# Items / Settings (from Sheets)
-# =============================================================================
-
 def load_items() -> List[Dict[str, Any]]:
-    """
-    Reads SHEET_ITEMS_NAME with header.
-    Required headers recommended:
-      item_id, name, price, active
-    Optional:
-      shipping_fee, max_qty, spec, flavor
-    """
     if not repo:
         return []
     try:
-        values = repo._get_values(_a1(SHEET_ITEMS_NAME, "A1:ZZ"))
-        if not values or len(values) < 2:
+        rows = repo.get_values(SHEET_ITEMS_NAME, "A1:ZZ")
+        if len(rows) < 2:
             return []
-        header = [str(x).strip() for x in values[0]]
+        header = [str(x).strip() for x in rows[0]]
         out = []
-        for row in values[1:]:
+        for r in rows[1:]:
             d = {}
             for i, h in enumerate(header):
                 if not h:
                     continue
-                d[h] = row[i] if i < len(row) else ""
+                d[h] = r[i] if i < len(r) else ""
             active = str(d.get("active", "1")).strip()
             if active in ("0", "false", "FALSE", "N", "n"):
                 continue
-            if "price" in d:
-                try:
-                    d["price"] = int(float(d["price"]))
-                except Exception:
-                    d["price"] = 0
+            try:
+                d["price"] = int(float(d.get("price", 0) or 0))
+            except Exception:
+                d["price"] = 0
+            d["item_id"] = str(d.get("item_id") or d.get("id") or d.get("name") or "").strip()
             out.append(d)
         return out
     except Exception as e:
@@ -613,568 +340,387 @@ def load_items() -> List[Dict[str, Any]]:
         return []
 
 
-def get_pickup_times() -> List[str]:
-    # settings key: pickup_times = "11:00-12:00,12:00-14:00,14:00-16:00"
-    return get_setting_csv_list("pickup_times", ["11:00-12:00", "12:00-14:00", "14:00-16:00"])
-
-
-def calc_shipping_fee(pickup_method: str, amount: int) -> int:
-    # settings key: shipping_fee = 180
-    if pickup_method == "宅配":
-        return get_setting_int("shipping_fee", 180)
-    return 0
-
 # =============================================================================
-# Business date rules (settings-first, env fallback)
+# Flex (stable, no debug, NT$ not truncated)
 # =============================================================================
-
-def _is_closed_date(d: dt.date) -> bool:
-    # settings: closed_dates, closed_weekday (single)
-    try:
-        s = load_settings()
-        if s:
-            closed_dates = set(get_setting_csv_list("closed_dates", []))
-            cw_raw = s.get("closed_weekday", "")
-            if str(cw_raw).strip() != "":
-                cw = _coerce_int(cw_raw, -999)
-                if cw != -999 and d.weekday() == cw:
-                    return True
-            if _date_to_str(d) in closed_dates:
-                return True
-    except Exception:
-        pass
-
-    # env fallback
-    if _date_to_str(d) in CLOSED_DATES_ENV:
-        return True
-    if d.weekday() in CLOSED_WEEKDAYS_ENV:
-        return True
-    return False
-
-
-def list_available_dates() -> List[str]:
-    """
-    Returns available dates from min_days to max_days ahead, excluding closed dates.
-    settings keys: min_days, max_days
-    """
-    min_days = get_setting_int("min_days", MIN_DAYS_ENV)
-    max_days = get_setting_int("max_days", MAX_DAYS_ENV)
-
-    # safety
-    if min_days < 0:
-        min_days = MIN_DAYS_ENV
-    if max_days < min_days:
-        max_days = max(min_days, MAX_DAYS_ENV)
-
-    today = _today_tz()
-    out = []
-    for delta in range(int(min_days), int(max_days) + 1):
-        d = today + dt.timedelta(days=delta)
-        if _is_closed_date(d):
-            continue
-        out.append(_date_to_str(d))
-    return out
-
-# =============================================================================
-# Flex Message Builders
-# =============================================================================
-
 def flex_main_menu() -> Dict[str, Any]:
     return {
         "type": "flex",
-        "altText": "UooUoo 甜點下單選單",
+        "altText": "UooUoo 甜點下單",
         "contents": {
             "type": "bubble",
             "size": "giga",
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "spacing": "md",
-                "contents": [
-                    {"type": "text", "text": "UooUoo 甜點下單", "weight": "bold", "size": "xl", "wrap": True},
-                    {"type": "text", "text": "請選擇要做什麼：", "size": "md", "color": "#666666", "wrap": True},
-                    {
-                        "type": "button",
-                        "style": "primary",
-                        "action": {"type": "postback", "label": "🍰 甜點清單", "data": "PB:ITEMS"},
-                    },
-                    {
-                        "type": "button",
-                        "style": "secondary",
-                        "action": {"type": "postback", "label": "🛒 查看購物車", "data": "PB:CART"},
-                    },
-                    {
-                        "type": "button",
-                        "style": "secondary",
-                        "action": {"type": "postback", "label": "📦 取貨說明", "data": "PB:HOW_PICKUP"},
-                    },
-                    {
-                        "type": "button",
-                        "style": "secondary",
-                        "action": {"type": "postback", "label": "💳 付款資訊", "data": "PB:PAY_INFO"},
-                    },
-                ],
-            },
-        },
+            "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+                {"type": "text", "text": "UooUoo 甜點下單", "weight": "bold", "size": "xl", "wrap": True},
+                {"type": "text", "text": "請選擇：", "size": "md", "color": "#666666", "wrap": True},
+                {"type": "button", "style": "primary",
+                 "action": {"type": "postback", "label": "🍰 甜點清單", "data": "PB:ITEMS"}},
+                {"type": "button", "style": "secondary",
+                 "action": {"type": "postback", "label": "🛒 查看購物車", "data": "PB:CART"}},
+                {"type": "button", "style": "secondary",
+                 "action": {"type": "postback", "label": "💳 付款資訊", "data": "PB:PAY_INFO"}},
+            ]}
+        }
     }
 
-
-def flex_items_list(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    contents = []
+def flex_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    blocks = []
     if not items:
-        contents.append({"type": "text", "text": "目前沒有可下單的品項。", "wrap": True})
+        blocks.append({"type": "text", "text": "目前沒有可下單品項。", "wrap": True})
     else:
         for it in items[:12]:
             name = str(it.get("name", ""))
             price = int(it.get("price", 0) or 0)
-            item_id = str(it.get("item_id", it.get("id", name)))
-            contents.append(
-                {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "spacing": "md",
-                    "contents": [
-                        {
-                            "type": "box",
-                            "layout": "vertical",
-                            "flex": 1,
-                            "contents": [
-                                {"type": "text", "text": name, "weight": "bold", "size": "md", "wrap": True},
-                                {"type": "text", "text": _fmt_currency(price), "size": "sm", "color": "#666666", "wrap": True},
-                            ],
-                        },
-                        {
-                            "type": "button",
-                            "style": "primary",
-                            "height": "sm",
-                            "action": {"type": "postback", "label": "加入", "data": f"PB:ADD_ITEM:{item_id}"},
-                        },
-                    ],
-                }
-            )
-
+            item_id = str(it.get("item_id", ""))
+            blocks.append({
+                "type": "box", "layout": "horizontal", "spacing": "md",
+                "contents": [
+                    {"type": "box", "layout": "vertical", "flex": 1, "contents": [
+                        {"type": "text", "text": name, "weight": "bold", "wrap": True},
+                        {"type": "text", "text": _fmt_currency(price), "size": "sm", "color": "#666666", "wrap": True},
+                    ]},
+                    {"type": "button", "style": "primary", "height": "sm",
+                     "action": {"type": "postback", "label": "加入", "data": f"PB:ADD:{item_id}"}},
+                ]
+            })
     return {
         "type": "flex",
         "altText": "甜點清單",
-        "contents": {
-            "type": "bubble",
-            "size": "giga",
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "spacing": "md",
-                "contents": [
-                    {"type": "text", "text": "甜點清單", "weight": "bold", "size": "xl", "wrap": True},
-                    {"type": "separator"},
-                    *contents,
-                    {"type": "separator"},
-                    {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "🛒 查看購物車", "data": "PB:CART"}},
-                ],
-            },
-        },
+        "contents": {"type": "bubble", "size": "giga", "body": {
+            "type": "box", "layout": "vertical", "spacing": "md", "contents": [
+                {"type": "text", "text": "甜點清單", "weight": "bold", "size": "xl", "wrap": True},
+                {"type": "separator"},
+                *blocks,
+                {"type": "separator"},
+                {"type": "button", "style": "secondary",
+                 "action": {"type": "postback", "label": "🛒 查看購物車", "data": "PB:CART"}},
+            ]
+        }}
+    }
+
+def flex_pay_info() -> Dict[str, Any]:
+    lines = []
+    if BANK_NAME or BANK_CORE or BANK_ACCOUNT:
+        if BANK_NAME or BANK_CORE:
+            lines.append(f"{BANK_NAME} {BANK_CORE}".strip())
+        if BANK_ACCOUNT:
+            lines.append(f"帳號：{BANK_ACCOUNT}")
+    else:
+        lines.append("（尚未設定匯款資訊）")
+    return {
+        "type": "flex",
+        "altText": "付款資訊",
+        "contents": {"type": "bubble", "size": "giga", "body": {
+            "type": "box", "layout": "vertical", "spacing": "md", "contents": [
+                {"type": "text", "text": "付款資訊", "weight": "bold", "size": "xl", "wrap": True},
+                {"type": "separator"},
+                {"type": "text", "text": "\n".join(lines), "wrap": True},
+                {"type": "text", "text": "匯款後請回覆：訂單編號＋末五碼", "size": "sm", "color": "#666666", "wrap": True},
+            ]
+        }}
     }
 
 
-def flex_cart(cart: List[CartItem], pickup_method: str = "", pickup_date: str = "", pickup_time: str = "", shipping_fee: int = 0) -> Dict[str, Any]:
-    item_lines: List[Dict[str, Any]] = []
-    total = 0
-    for ci in cart:
-        total += ci.subtotal
-        item_lines.append(
-            {
-                "type": "box",
-                "layout": "horizontal",
-                "contents": [
-                    {"type": "text", "text": f"{ci.name} ×{ci.qty}", "flex": 1, "wrap": True},
-                    {"type": "text", "text": _fmt_currency(ci.subtotal), "align": "end", "wrap": True},
-                ],
-            }
-        )
+# =============================================================================
+# Session (minimal, stable)
+# =============================================================================
+_SESS_LOCK = threading.Lock()
+_SESS: Dict[str, Dict[str, Any]] = {}
+_SESS_TTL = 3600
 
-    if not item_lines:
-        item_lines.append({"type": "text", "text": "（購物車是空的）", "size": "sm", "color": "#666666", "wrap": True})
+def _sess(user_id: str) -> Dict[str, Any]:
+    now = time.time()
+    with _SESS_LOCK:
+        dead = [u for u, s in _SESS.items() if s.get("_exp", 0) <= now]
+        for u in dead:
+            _SESS.pop(u, None)
+        s = _SESS.get(user_id)
+        if not s:
+            s = {"_exp": now + _SESS_TTL, "cart": []}
+            _SESS[user_id] = s
+        s["_exp"] = now + _SESS_TTL
+        return s
 
-    grand_total = total + int(shipping_fee)
+def _cart_total(cart: List[Dict[str, Any]]) -> int:
+    return sum(int(x.get("unit_price", 0)) * int(x.get("qty", 1)) for x in cart)
 
-    meta_lines: List[Dict[str, Any]] = []
-    if pickup_method:
-        meta_lines.append({"type": "text", "text": f"取貨方式：{pickup_method}", "size": "sm", "color": "#666666", "wrap": True})
-    if pickup_date:
-        meta_lines.append({"type": "text", "text": f"日期：{pickup_date}", "size": "sm", "color": "#666666", "wrap": True})
-    if pickup_time:
-        meta_lines.append({"type": "text", "text": f"時段：{pickup_time}", "size": "sm", "color": "#666666", "wrap": True})
+def _shipping_fee(method: str) -> int:
+    return 180 if method == "宅配" else 0
+
+def flex_cart(sess: Dict[str, Any]) -> Dict[str, Any]:
+    cart = sess.get("cart", [])
+    lines = []
+    subtotal = 0
+    for it in cart:
+        name = str(it.get("name", ""))
+        qty = int(it.get("qty", 1))
+        unit = int(it.get("unit_price", 0))
+        sub = qty * unit
+        subtotal += sub
+        lines.append({
+            "type": "box", "layout": "horizontal",
+            "contents": [
+                {"type": "text", "text": f"{name} ×{qty}", "flex": 1, "wrap": True},
+                {"type": "text", "text": _fmt_currency(sub), "align": "end", "wrap": True},
+            ]
+        })
+    if not lines:
+        lines.append({"type": "text", "text": "（購物車是空的）", "size": "sm", "color": "#666666", "wrap": True})
+
+    pm = sess.get("pickup_method", "")
+    pd = sess.get("pickup_date", "")
+    pt = sess.get("pickup_time", "")
+    ship = int(sess.get("shipping_fee", 0) or 0)
+    grand = subtotal + ship
+
+    meta = []
+    if pm: meta.append({"type":"text","text":f"取貨方式：{pm}","size":"sm","color":"#666666","wrap":True})
+    if pd: meta.append({"type":"text","text":f"日期：{pd}","size":"sm","color":"#666666","wrap":True})
+    if pt: meta.append({"type":"text","text":f"時段：{pt}","size":"sm","color":"#666666","wrap":True})
 
     return {
         "type": "flex",
         "altText": "結帳內容",
-        "contents": {
-            "type": "bubble",
-            "size": "giga",
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "spacing": "md",
-                "contents": [
-                    {"type": "text", "text": "結帳內容", "weight": "bold", "size": "xl", "wrap": True},
-                    {"type": "separator"},
-                    *item_lines,
-                    {"type": "separator"},
-                    *meta_lines,
-                    {
-                        "type": "box",
-                        "layout": "vertical",
-                        "spacing": "xs",
-                        "contents": [
-                            {"type": "box", "layout": "horizontal", "contents": [{"type": "text", "text": "小計", "flex": 1, "wrap": True}, {"type": "text", "text": _fmt_currency(total), "align": "end", "wrap": True}]},
-                            {"type": "box", "layout": "horizontal", "contents": [{"type": "text", "text": "運費", "flex": 1, "wrap": True}, {"type": "text", "text": _fmt_currency(shipping_fee), "align": "end", "wrap": True}]},
-                            {"type": "box", "layout": "horizontal", "contents": [{"type": "text", "text": "合計", "flex": 1, "weight": "bold", "wrap": True}, {"type": "text", "text": _fmt_currency(grand_total), "align": "end", "weight": "bold", "wrap": True}]},
-                        ],
-                    },
-                    {"type": "separator"},
-                    {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "🔧 修改品項", "data": "PB:EDIT_CART"}},
-                    {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🧾 前往結帳", "data": "PB:CHECKOUT"}},
-                    {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "➕ 繼續加購", "data": "PB:ITEMS"}},
-                ],
-            },
-        },
+        "contents": {"type":"bubble","size":"giga","body":{
+            "type":"box","layout":"vertical","spacing":"md","contents":[
+                {"type":"text","text":"結帳內容","weight":"bold","size":"xl","wrap":True},
+                {"type":"separator"},
+                *lines,
+                {"type":"separator"},
+                *meta,
+                {"type":"box","layout":"vertical","spacing":"xs","contents":[
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"小計","flex":1,"wrap":True},
+                        {"type":"text","text":_fmt_currency(subtotal),"align":"end","wrap":True},
+                    ]},
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"運費","flex":1,"wrap":True},
+                        {"type":"text","text":_fmt_currency(ship),"align":"end","wrap":True},
+                    ]},
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"合計","flex":1,"weight":"bold","wrap":True},
+                        {"type":"text","text":_fmt_currency(grand),"align":"end","weight":"bold","wrap":True},
+                    ]},
+                ]},
+                {"type":"separator"},
+                {"type":"button","style":"primary",
+                 "action":{"type":"postback","label":"🧾 前往結帳","data":"PB:CHECKOUT"}},
+                {"type":"button","style":"secondary",
+                 "action":{"type":"postback","label":"➕ 繼續加購","data":"PB:ITEMS"}},
+            ]
+        }}
     }
 
 
-def flex_payment_info() -> Dict[str, Any]:
-    text_lines = []
-    if BANK_NAME or BANK_CORE or BANK_ACCOUNT:
-        text_lines.append(f"{BANK_NAME} {BANK_CORE}".strip())
-        text_lines.append(f"帳號：{BANK_ACCOUNT}".strip())
+# =============================================================================
+# Sheets writes (never crash webhook)
+# =============================================================================
+def safe_append(sheet: str, row: Dict[str, Any]) -> None:
+    if not repo:
+        return
+    try:
+        repo.append_by_header(sheet, row)
+    except Exception as e:
+        # NEVER raise; avoid killing service
+        print(f"[Sheets] append failed ({sheet}):", repr(e))
+
+def safe_update_status(order_id: str, status: str) -> None:
+    if not repo:
+        return
+    try:
+        idx = repo.find_row_index(SHEET_A_NAME, "order_id", order_id)
+        if idx:
+            updates = {"updated_at": dt.datetime.utcnow().isoformat() + "Z", "status": status}
+            if status == "PAID":
+                updates["payment_status"] = "PAID"
+            if status in ("READY", "SHIPPED"):
+                updates["ship_status"] = status
+            repo.update_cells(SHEET_A_NAME, idx, updates)
+    except Exception as e:
+        print("[Sheets] update status failed:", repr(e))
+
+    # log C & c_log
+    ts = dt.datetime.utcnow().isoformat() + "Z"
+    safe_append(SHEET_C_NAME, {"created_at": ts, "order_id": order_id, "flow_type": "STATUS", "status": status})
+    safe_append(SHEET_CLOG_NAME, {"created_at": ts, "order_id": order_id, "event": f"STATUS_{status}", "payload": ""})
+
+
+# =============================================================================
+# Checkout flow
+# =============================================================================
+PICKUP_TIMES = ["11:00-12:00", "12:00-14:00", "14:00-16:00"]
+
+async def start_checkout(user_id: str, reply_token: str) -> None:
+    s = _sess(user_id)
+    if not s.get("cart"):
+        await line_reply(reply_token, [_text_message("購物車是空的，請先加入品項。")])
+        return
+    flex = {
+        "type": "flex",
+        "altText": "選擇取貨方式",
+        "contents": {"type":"bubble","size":"giga","body":{
+            "type":"box","layout":"vertical","spacing":"md","contents":[
+                {"type":"text","text":"選擇取貨方式","weight":"bold","size":"xl","wrap":True},
+                {"type":"separator"},
+                {"type":"button","style":"primary","action":{"type":"postback","label":"🏠 店取","data":"PB:PM:店取"}},
+                {"type":"button","style":"primary","action":{"type":"postback","label":"🚚 宅配","data":"PB:PM:宅配"}},
+            ]
+        }}
+    }
+    await line_reply(reply_token, [flex])
+
+async def pick_date(user_id: str, reply_token: str) -> None:
+    dates = list_available_dates()
+    if not dates:
+        await line_reply(reply_token, [_text_message("近期無可選日期，請稍後再試。")])
+        return
+    btns = []
+    for d in dates[:10]:
+        btns.append({"type":"button","style":"secondary","action":{"type":"postback","label":d,"data":f"PB:DATE:{d}"}})
+    flex = {
+        "type":"flex","altText":"選擇日期",
+        "contents":{"type":"bubble","size":"giga","body":{
+            "type":"box","layout":"vertical","spacing":"md","contents":[
+                {"type":"text","text":"選擇日期","weight":"bold","size":"xl","wrap":True},
+                {"type":"text","text":f"（可選 {MIN_DAYS}–{MAX_DAYS} 天內）","size":"sm","color":"#666666","wrap":True},
+                {"type":"separator"},
+                *btns
+            ]
+        }}
+    }
+    await line_reply(reply_token, [flex])
+
+async def pick_time(user_id: str, reply_token: str) -> None:
+    btns=[]
+    for t in PICKUP_TIMES:
+        btns.append({"type":"button","style":"secondary","action":{"type":"postback","label":t,"data":f"PB:TIME:{t}"}})
+    flex = {
+        "type":"flex","altText":"選擇時段",
+        "contents":{"type":"bubble","size":"giga","body":{
+            "type":"box","layout":"vertical","spacing":"md","contents":[
+                {"type":"text","text":"選擇時段","weight":"bold","size":"xl","wrap":True},
+                {"type":"separator"},
+                *btns
+            ]
+        }}
+    }
+    await line_reply(reply_token, [flex])
+
+async def finalize_order(user_id: str, reply_token: str) -> None:
+    s = _sess(user_id)
+    cart = s.get("cart", [])
+    if not cart:
+        await line_reply(reply_token, [_text_message("購物車是空的，無法建立訂單。")])
+        return
+
+    pm = s.get("pickup_method","")
+    pd = s.get("pickup_date","")
+    pt = s.get("pickup_time","")
+    receiver = s.get("receiver_name","")
+    phone = s.get("phone","")
+    address = s.get("address","") if pm == "宅配" else ""
+
+    ship = _shipping_fee(pm)
+    s["shipping_fee"] = ship
+    subtotal = _cart_total(cart)
+    grand = subtotal + ship
+
+    oid = new_order_id()
+    ts = dt.datetime.utcnow().isoformat() + "Z"
+
+    items_json = json.dumps(cart, ensure_ascii=False)
+
+    note = ""
+    if pm == "宅配":
+        note = f"期望到貨:{pd} | 收件人:{receiver} | 電話:{phone} | 地址:{address}"
     else:
-        text_lines.append("（尚未設定匯款資訊）")
+        note = f"店取 {pd} {pt} | {receiver} | {phone}"
 
-    return {
-        "type": "flex",
-        "altText": "付款資訊",
-        "contents": {
-            "type": "bubble",
-            "size": "giga",
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "spacing": "md",
-                "contents": [
-                    {"type": "text", "text": "付款資訊", "weight": "bold", "size": "xl", "wrap": True},
-                    {"type": "separator"},
-                    {"type": "text", "text": "\n".join(text_lines), "wrap": True},
-                    {"type": "text", "text": "匯款後請回覆：訂單編號＋末五碼", "size": "sm", "color": "#666666", "wrap": True},
-                ],
-            },
-        },
-    }
-
-
-def flex_pickup_info() -> Dict[str, Any]:
-    # show settings-driven days if present; fallback to env
-    min_days = get_setting_int("min_days", MIN_DAYS_ENV)
-    max_days = get_setting_int("max_days", MAX_DAYS_ENV)
-
-    txt = [
-        f"店取：下單後可選 {min_days}–{max_days} 天內日期與時段。",
-        "宅配：選擇希望到貨日期（我們會依製作進度安排出貨）。",
-    ]
-    if STORE_ADDRESS:
-        txt.append(f"店址：{STORE_ADDRESS}")
-    return {
-        "type": "flex",
-        "altText": "取貨說明",
-        "contents": {"type": "bubble", "size": "giga", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-            {"type": "text", "text": "取貨說明", "weight": "bold", "size": "xl", "wrap": True},
-            {"type": "separator"},
-            {"type": "text", "text": "\n".join(txt), "wrap": True},
-        ]}},
-    }
-
-
-def flex_admin_actions(order_id: str) -> Dict[str, Any]:
-    return {
-        "type": "flex",
-        "altText": "商家管理",
-        "contents": {"type": "bubble", "size": "giga", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-            {"type": "text", "text": "商家管理", "weight": "bold", "size": "xl", "wrap": True},
-            {"type": "text", "text": f"訂單編號：{order_id}", "size": "sm", "color": "#666666", "wrap": True},
-            {"type": "separator"},
-            {"type": "button", "style": "primary", "action": {"type": "postback", "label": "✅ 已收款 (PAID)", "data": f"PB:ADMIN_PAID:{order_id}"}},
-            {"type": "button", "style": "primary", "action": {"type": "postback", "label": "📣 已做好，通知客人取貨 (READY)", "data": f"PB:ADMIN_READY:{order_id}"}},
-            {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🚚 已出貨，通知客人 (SHIPPED)", "data": f"PB:ADMIN_SHIPPED:{order_id}"}},
-        ]}},
-    }
-
-# =============================================================================
-# Order ID
-# =============================================================================
-
-def new_order_id() -> str:
-    today = _today_tz()
-    ymd = today.strftime("%Y%m%d")
-    tail = str(uuid.uuid4().int)[-4:]
-    return f"UOO-{ymd}-{tail}"
-
-# =============================================================================
-# Write to Sheets (A/B/C/C_LOG)
-# =============================================================================
-
-def write_order_to_sheets(order: OrderDraft) -> None:
-    if not repo:
-        return
-
-    created_at = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-    items_json = json.dumps(
-        [
-            {
-                "item_id": i.item_id,
-                "name": i.name,
-                "qty": i.qty,
-                "unit_price": i.unit_price,
-                "subtotal": i.subtotal,
-                "flavor": i.flavor,
-                "spec": i.spec,
-            }
-            for i in order.items
-        ],
-        ensure_ascii=False,
-    )
-
-    a_row = {
-        "created_at": created_at,
-        "user_id": order.user_id,
-        "display_name": order.display_name,
-        "order_id": order.order_id,
+    # A (summary)
+    safe_append(SHEET_A_NAME, {
+        "created_at": ts,
+        "order_id": oid,
+        "user_id": user_id,
         "items_json": items_json,
-        "pickup_method": order.pickup_method,
-        "pickup_date": order.pickup_date,
-        "pickup_time": order.pickup_time,
-        "note": order.note,
-        "amount": str(order.amount),
-        "shipping_fee": str(order.shipping_fee),
-        "grand_total": str(order.grand_total),
+        "pickup_method": pm,
+        "pickup_date": pd,
+        "pickup_time": pt,
+        "note": note,
+        "amount": str(subtotal),
+        "shipping_fee": str(ship),
+        "grand_total": str(grand),
         "payment_status": "UNPAID",
-        "ship_status": "",
         "status": "ORDER",
-    }
-    repo.append_by_header(SHEET_A_NAME, a_row)
+    })
 
-    for i in order.items:
-        b_row = {
-            "created_at": created_at,
-            "order_id": order.order_id,
-            "item_id": i.item_id,
-            "item_name": i.name,
-            "spec": i.spec,
-            "flavor": i.flavor,
-            "qty": str(i.qty),
-            "unit_price": str(i.unit_price),
-            "subtotal": str(i.subtotal),
-            "pickup_method": order.pickup_method,
-            "pickup_date": order.pickup_date,
-            "pickup_time": order.pickup_time,
-            "phone": order.phone,
-            "receiver_name": order.receiver_name,
-            "address": order.address,
-        }
-        repo.append_by_header(SHEET_B_NAME, b_row)
+    # B (detail) - one row per item (if your B has header)
+    for it in cart:
+        safe_append(SHEET_B_NAME, {
+            "created_at": ts,
+            "order_id": oid,
+            "item_id": it.get("item_id",""),
+            "item_name": it.get("name",""),
+            "qty": str(it.get("qty",1)),
+            "unit_price": str(it.get("unit_price",0)),
+            "subtotal": str(int(it.get("qty",1))*int(it.get("unit_price",0))),
+            "pickup_method": pm,
+            "pickup_date": pd,
+            "pickup_time": pt,
+            "phone": phone,
+            "receiver_name": receiver,
+            "address": address,
+        })
 
-    c_row = {
-        "created_at": created_at,
-        "order_id": order.order_id,
-        "flow_type": "ORDER",
-        "method": order.pickup_method,
-        "amount": str(order.amount),
-        "shipping_fee": str(order.shipping_fee),
-        "grand_total": str(order.grand_total),
-        "status": "ORDER",
-        "note": order.note,
-    }
-    try:
-        repo.append_by_header(SHEET_C_NAME, c_row)
-    except Exception as e:
-        print("[Sheets] append C failed:", repr(e))
+    # C & c_log
+    safe_append(SHEET_C_NAME, {
+        "created_at": ts, "order_id": oid, "flow_type": "ORDER",
+        "method": pm, "amount": str(subtotal), "shipping_fee": str(ship),
+        "grand_total": str(grand), "status": "ORDER", "note": note
+    })
+    safe_append(SHEET_CLOG_NAME, {"created_at": ts, "order_id": oid, "event": "ORDER_CREATED", "payload": items_json})
 
-    clog_row = {
-        "created_at": created_at,
-        "order_id": order.order_id,
-        "event": "ORDER_CREATED",
-        "payload": items_json,
-    }
-    try:
-        repo.append_by_header(SHEET_C_LOG_NAME, clog_row)
-    except Exception as e:
-        print("[Sheets] append c_log failed:", repr(e))
+    # Customer message (NO debug)
+    await line_reply(reply_token, [
+        _text_message(f"✅ 訂單已建立（待轉帳）\n訂單編號：{oid}\n合計：{_fmt_currency(grand)}\n匯款後請回覆：訂單編號＋末五碼"),
+    ])
 
+    # clear cart + checkout fields
+    s["cart"] = []
+    for k in ("pickup_method","pickup_date","pickup_time","receiver_name","phone","address","awaiting"):
+        s.pop(k, None)
 
-def update_order_status(order_id: str, status: str) -> None:
-    """
-    Update A sheet + append C + c_log
-    status: PAID / READY / SHIPPED
-    """
-    if not repo:
-        return
-
-    created_at = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-    row_idx = repo.find_row_index(SHEET_A_NAME, "order_id", order_id)
-    if row_idx:
-        updates: Dict[str, Any] = {}
-        if status == "PAID":
-            updates["payment_status"] = "PAID"
-        elif status == "READY":
-            updates["ship_status"] = "READY"
-        elif status == "SHIPPED":
-            updates["ship_status"] = "SHIPPED"
-        updates["status"] = status
-        updates["updated_at"] = created_at
-        repo.update_cells_by_header(SHEET_A_NAME, row_idx, updates)
-
-    c_row = {
-        "created_at": created_at,
-        "order_id": order_id,
-        "flow_type": "STATUS",
-        "status": status,
-        "note": "已收款" if status == "PAID" else ("店取已做好通知" if status == "READY" else "宅配已出貨通知"),
-    }
-    try:
-        repo.append_by_header(SHEET_C_NAME, c_row)
-    except Exception as e:
-        print("[Sheets] append C STATUS failed:", repr(e))
-
-    clog_row = {"created_at": created_at, "order_id": order_id, "event": f"STATUS_{status}", "payload": ""}
-    try:
-        repo.append_by_header(SHEET_C_LOG_NAME, clog_row)
-    except Exception as e:
-        print("[Sheets] append c_log STATUS failed:", repr(e))
 
 # =============================================================================
-# Optional: Google Calendar
+# Handlers
 # =============================================================================
-
-def create_calendar_event_for_order(order: OrderDraft) -> None:
-    if not GCAL_CALENDAR_ID or not GOOGLE_SERVICE_ACCOUNT_B64:
-        return
-    if not order.pickup_date:
-        return
-
-    try:
-        tz = GCAL_TIMEZONE or "Asia/Taipei"
-        date = order.pickup_date
-
-        if order.pickup_method == "店取" and order.pickup_time:
-            m = re.match(r"(\d{2}:\d{2})-(\d{2}:\d{2})", order.pickup_time.strip())
-            if m:
-                st, et = m.group(1), m.group(2)
-            else:
-                st, et = "12:00", "12:30"
-        else:
-            st, et = "10:00", "10:30"
-
-        start_dt = f"{date}T{st}:00"
-        end_dt = f"{date}T{et}:00"
-
-        title = f"UooUoo 訂單 {order.order_id} ({order.pickup_method})"
-        desc_lines = [
-            f"訂單：{order.order_id}",
-            f"取貨方式：{order.pickup_method}",
-            f"日期：{order.pickup_date}",
-            f"時段：{order.pickup_time}" if order.pickup_time else "",
-            f"客人：{order.receiver_name} {order.phone}",
-            f"地址：{order.address}" if order.address else "",
-            f"金額：{_fmt_currency(order.grand_total)}",
-        ]
-        description = "\n".join([x for x in desc_lines if x])
-
-        location = STORE_ADDRESS if order.pickup_method == "店取" else (order.address or "")
-
-        svc = cal_service()
-        event = {
-            "summary": title,
-            "description": description,
-            "location": location,
-            "start": {"dateTime": start_dt, "timeZone": tz},
-            "end": {"dateTime": end_dt, "timeZone": tz},
-        }
-        svc.events().insert(calendarId=GCAL_CALENDAR_ID, body=event).execute()
-
-    except Exception as e:
-        print("[GCAL] create event failed:", repr(e))
-
-# =============================================================================
-# Conversation flows
-# =============================================================================
-
-def _ensure_cart(sess: Dict[str, Any]) -> List[CartItem]:
-    if "cart" not in sess:
-        sess["cart"] = []
-    return sess["cart"]
-
-
-def _find_item_by_id(items: List[Dict[str, Any]], item_id: str) -> Optional[Dict[str, Any]]:
-    for it in items:
-        if str(it.get("item_id", it.get("id", ""))).strip() == item_id:
-            return it
-    return None
-
-
-def _cart_add(user_id: str, item: Dict[str, Any]) -> None:
-    sess = _sess_get(user_id)
-    cart = _ensure_cart(sess)
-    item_id = str(item.get("item_id", item.get("id", item.get("name", ""))))
-    name = str(item.get("name", ""))
-    price = int(item.get("price", 0) or 0)
-
-    for ci in cart:
-        if ci.item_id == item_id:
-            ci.qty += 1
-            return
-    cart.append(CartItem(item_id=item_id, name=name, unit_price=price, qty=1))
-
-
-def _cart_set_qty(user_id: str, item_id: str, delta: int) -> None:
-    sess = _sess_get(user_id)
-    cart = _ensure_cart(sess)
-    for ci in list(cart):
-        if ci.item_id == item_id:
-            ci.qty = max(0, ci.qty + delta)
-            if ci.qty <= 0:
-                cart.remove(ci)
-            return
-
-# =============================================================================
-# LINE Event handlers
-# =============================================================================
-
-def _text_message(text: str) -> Dict[str, Any]:
-    return {"type": "text", "text": text}
-
-
-def _get_user_profile(user_id: str) -> Tuple[str, str]:
-    if not user_id:
-        return "", ""
-    try:
-        url = f"https://api.line.me/v2/bot/profile/{user_id}"
-        headers = _line_headers()
-        r = httpx.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            j = r.json()
-            return j.get("displayName", ""), j.get("pictureUrl", "")
-    except Exception:
-        pass
-    return "", ""
-
-
 async def handle_text(user_id: str, reply_token: str, text: str) -> None:
     t = (text or "").strip()
+    s = _sess(user_id)
 
-    # Admin quick access by typing order id
-    if t.startswith("UOO-") and is_admin(user_id):
-        await line_reply(reply_token, [flex_admin_actions(t)])
+    # follow-up fields
+    awaiting = s.get("awaiting","")
+    if awaiting == "receiver_name":
+        s["receiver_name"] = t
+        s["awaiting"] = "phone"
+        await line_reply(reply_token, [_text_message("請輸入電話：")])
+        return
+    if awaiting == "phone":
+        s["phone"] = t
+        if s.get("pickup_method") == "宅配":
+            s["awaiting"] = "address"
+            await line_reply(reply_token, [_text_message("請輸入宅配地址（完整地址）：")])
+        else:
+            s["awaiting"] = ""
+            await finalize_order(user_id, reply_token)
+        return
+    if awaiting == "address":
+        s["address"] = t
+        s["awaiting"] = ""
+        await finalize_order(user_id, reply_token)
         return
 
-    if t in ("選單", "menu", "開始", "start"):
+    # normal commands
+    if t in ("開始", "選單", "menu", "start"):
         await line_reply(reply_token, [flex_main_menu()])
         return
 
@@ -1183,313 +729,76 @@ async def handle_text(user_id: str, reply_token: str, text: str) -> None:
 
 async def handle_postback(user_id: str, reply_token: str, data: str) -> None:
     data = (data or "").strip()
-    sess = _sess_get(user_id)
+    s = _sess(user_id)
 
     if data == "PB:ITEMS":
         items = load_items()
-        await line_reply(reply_token, [flex_items_list(items)])
+        await line_reply(reply_token, [flex_items(items)])
         return
 
-    if data.startswith("PB:ADD_ITEM:"):
-        item_id = data.split("PB:ADD_ITEM:", 1)[1].strip()
+    if data.startswith("PB:ADD:"):
+        item_id = data.split("PB:ADD:", 1)[1].strip()
         items = load_items()
-        it = _find_item_by_id(items, item_id)
-        if it:
-            _cart_add(user_id, it)
-            await line_reply(reply_token, [_text_message("已加入購物車。"), flex_main_menu()])
+        it = next((x for x in items if str(x.get("item_id","")).strip() == item_id), None)
+        if not it:
+            await line_reply(reply_token, [_text_message("找不到這個品項，請重新選擇。"), flex_items(items)])
+            return
+        cart = s.get("cart", [])
+        found = None
+        for c in cart:
+            if c.get("item_id") == item_id:
+                found = c
+                break
+        if found:
+            found["qty"] = int(found.get("qty",1)) + 1
         else:
-            await line_reply(reply_token, [_text_message("找不到這個品項，請重新選擇。"), flex_items_list(items)])
+            cart.append({"item_id": item_id, "name": it.get("name",""), "unit_price": int(it.get("price",0) or 0), "qty": 1})
+        s["cart"] = cart
+        await line_reply(reply_token, [_text_message("已加入購物車。")])
         return
 
     if data == "PB:CART":
-        cart = _ensure_cart(sess)
-        pickup_method = sess.get("pickup_method", "")
-        pickup_date = sess.get("pickup_date", "")
-        pickup_time = sess.get("pickup_time", "")
-        shipping_fee = int(sess.get("shipping_fee", 0) or 0)
-        await line_reply(reply_token, [flex_cart(cart, pickup_method, pickup_date, pickup_time, shipping_fee)])
-        return
-
-    if data == "PB:HOW_PICKUP":
-        await line_reply(reply_token, [flex_pickup_info()])
+        await line_reply(reply_token, [flex_cart(s)])
         return
 
     if data == "PB:PAY_INFO":
-        await line_reply(reply_token, [flex_payment_info()])
-        return
-
-    if data == "PB:EDIT_CART":
-        cart = _ensure_cart(sess)
-        if not cart:
-            await line_reply(reply_token, [_text_message("購物車目前是空的。"), flex_items_list(load_items())])
-            return
-
-        lines = []
-        for ci in cart:
-            lines.append(
-                {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "spacing": "sm",
-                    "contents": [
-                        {"type": "text", "text": f"{ci.name} ×{ci.qty}", "flex": 1, "wrap": True},
-                        {"type": "button", "style": "secondary", "height": "sm",
-                         "action": {"type": "postback", "label": "➖", "data": f"PB:QTY_DEC:{ci.item_id}"}},
-                        {"type": "button", "style": "secondary", "height": "sm",
-                         "action": {"type": "postback", "label": "➕", "data": f"PB:QTY_INC:{ci.item_id}"}},
-                    ],
-                }
-            )
-
-        flex = {
-            "type": "flex",
-            "altText": "修改品項",
-            "contents": {"type": "bubble", "size": "giga", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-                {"type": "text", "text": "修改品項", "weight": "bold", "size": "xl", "wrap": True},
-                {"type": "separator"},
-                *lines,
-                {"type": "separator"},
-                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🧾 回到結帳", "data": "PB:CART"}},
-            ]}},
-        }
-        await line_reply(reply_token, [flex])
-        return
-
-    if data.startswith("PB:QTY_DEC:"):
-        item_id = data.split("PB:QTY_DEC:", 1)[1].strip()
-        _cart_set_qty(user_id, item_id, -1)
-        await handle_postback(user_id, reply_token, "PB:EDIT_CART")
-        return
-
-    if data.startswith("PB:QTY_INC:"):
-        item_id = data.split("PB:QTY_INC:", 1)[1].strip()
-        _cart_set_qty(user_id, item_id, +1)
-        await handle_postback(user_id, reply_token, "PB:EDIT_CART")
+        await line_reply(reply_token, [flex_pay_info()])
         return
 
     if data == "PB:CHECKOUT":
-        cart = _ensure_cart(sess)
-        if not cart:
-            await line_reply(reply_token, [_text_message("購物車是空的，請先加入品項。"), flex_items_list(load_items())])
-            return
-
-        flex = {
-            "type": "flex",
-            "altText": "選擇取貨方式",
-            "contents": {"type": "bubble", "size": "giga", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-                {"type": "text", "text": "選擇取貨方式", "weight": "bold", "size": "xl", "wrap": True},
-                {"type": "separator"},
-                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🏠 店取", "data": "PB:PM:店取"}},
-                {"type": "button", "style": "primary", "action": {"type": "postback", "label": "🚚 宅配", "data": "PB:PM:宅配"}},
-            ]}},
-        }
-        await line_reply(reply_token, [flex])
+        await start_checkout(user_id, reply_token)
         return
 
     if data.startswith("PB:PM:"):
-        pickup_method = data.split("PB:PM:", 1)[1].strip()
-        sess["pickup_method"] = pickup_method
-
-        dates = list_available_dates()
-        if not dates:
-            await line_reply(reply_token, [_text_message("近期無可選日期，請稍後再試。")])
-            return
-
-        min_days = get_setting_int("min_days", MIN_DAYS_ENV)
-        max_days = get_setting_int("max_days", MAX_DAYS_ENV)
-
-        btns = []
-        for d in dates[:10]:
-            btns.append({"type": "button", "style": "secondary", "action": {"type": "postback", "label": d, "data": f"PB:DATE:{d}"}})
-        flex = {
-            "type": "flex",
-            "altText": "選擇日期",
-            "contents": {"type": "bubble", "size": "giga", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-                {"type": "text", "text": "選擇日期", "weight": "bold", "size": "xl", "wrap": True},
-                {"type": "text", "text": f"（可選 {min_days}–{max_days} 天內）", "size": "sm", "color": "#666666", "wrap": True},
-                {"type": "separator"},
-                *btns,
-            ]}},
-        }
-        await line_reply(reply_token, [flex])
+        s["pickup_method"] = data.split("PB:PM:",1)[1].strip()
+        await pick_date(user_id, reply_token)
         return
 
     if data.startswith("PB:DATE:"):
-        d = data.split("PB:DATE:", 1)[1].strip()
-        sess["pickup_date"] = d
-
-        pickup_method = sess.get("pickup_method", "")
-        if pickup_method == "店取":
-            btns = []
-            for t in get_pickup_times():
-                btns.append({"type": "button", "style": "secondary", "action": {"type": "postback", "label": t, "data": f"PB:TIME:{t}"}})
-            flex = {
-                "type": "flex",
-                "altText": "選擇時段",
-                "contents": {"type": "bubble", "size": "giga", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-                    {"type": "text", "text": "選擇時段", "weight": "bold", "size": "xl", "wrap": True},
-                    {"type": "separator"},
-                    *btns,
-                ]}},
-            }
-            await line_reply(reply_token, [flex])
+        s["pickup_date"] = data.split("PB:DATE:",1)[1].strip()
+        if s.get("pickup_method") == "店取":
+            await pick_time(user_id, reply_token)
         else:
-            sess["pickup_time"] = ""
+            s["pickup_time"] = ""
+            s["awaiting"] = "receiver_name"
             await line_reply(reply_token, [_text_message("請輸入收件人姓名：")])
-            sess["awaiting"] = "receiver_name"
         return
 
     if data.startswith("PB:TIME:"):
-        t = data.split("PB:TIME:", 1)[1].strip()
-        sess["pickup_time"] = t
+        s["pickup_time"] = data.split("PB:TIME:",1)[1].strip()
+        s["awaiting"] = "receiver_name"
         await line_reply(reply_token, [_text_message("請輸入取件人姓名：")])
-        sess["awaiting"] = "receiver_name"
         return
-
-    # Admin actions
-    if data.startswith("PB:ADMIN_"):
-        if not is_admin(user_id):
-            await line_reply(reply_token, [_text_message("此功能僅限商家使用。")])
-            return
-
-        if data.startswith("PB:ADMIN_PAID:"):
-            oid = data.split("PB:ADMIN_PAID:", 1)[1].strip()
-            update_order_status(oid, "PAID")
-            await line_reply(reply_token, [_text_message("已標記為已收款。")])
-            return
-
-        if data.startswith("PB:ADMIN_READY:"):
-            oid = data.split("PB:ADMIN_READY:", 1)[1].strip()
-            update_order_status(oid, "READY")
-            await line_reply(reply_token, [_text_message("已標記為 READY。")])
-            return
-
-        if data.startswith("PB:ADMIN_SHIPPED:"):
-            oid = data.split("PB:ADMIN_SHIPPED:", 1)[1].strip()
-            update_order_status(oid, "SHIPPED")
-            await line_reply(reply_token, [_text_message("已標記為 SHIPPED。")])
-            return
 
     await line_reply(reply_token, [flex_main_menu()])
 
 
-async def handle_followup_text(user_id: str, reply_token: str, text: str) -> bool:
-    """
-    Checkout follow-up:
-      receiver_name -> phone -> address(if delivery) / done(if pickup)
-    """
-    sess = _sess_get(user_id)
-    awaiting = sess.get("awaiting", "")
-
-    if awaiting == "receiver_name":
-        sess["receiver_name"] = (text or "").strip()
-        sess["awaiting"] = "phone"
-        await line_reply(reply_token, [_text_message("請輸入電話：")])
-        return True
-
-    if awaiting == "phone":
-        sess["phone"] = (text or "").strip()
-        pm = sess.get("pickup_method", "")
-        if pm == "宅配":
-            sess["awaiting"] = "address"
-            await line_reply(reply_token, [_text_message("請輸入宅配地址（完整地址）：")])
-        else:
-            sess["awaiting"] = ""
-            await finalize_order(user_id, reply_token)
-        return True
-
-    if awaiting == "address":
-        sess["address"] = (text or "").strip()
-        sess["awaiting"] = ""
-        await finalize_order(user_id, reply_token)
-        return True
-
-    return False
-
-
-async def finalize_order(user_id: str, reply_token: str) -> None:
-    sess = _sess_get(user_id)
-    cart: List[CartItem] = _ensure_cart(sess)
-    if not cart:
-        await line_reply(reply_token, [_text_message("購物車是空的，無法建立訂單。")])
-        return
-
-    display_name, _ = _get_user_profile(user_id)
-    pm = sess.get("pickup_method", "")
-    pickup_date = sess.get("pickup_date", "")
-    pickup_time = sess.get("pickup_time", "")
-    receiver_name = sess.get("receiver_name", "")
-    phone = sess.get("phone", "")
-    address = sess.get("address", "") if pm == "宅配" else ""
-
-    shipping_fee = calc_shipping_fee(pm, sum(i.subtotal for i in cart))
-    sess["shipping_fee"] = shipping_fee
-
-    oid = new_order_id()
-
-    if pm == "宅配":
-        note = f"期望到貨:{pickup_date} | 收件人:{receiver_name} | 電話:{phone} | 地址:{address}"
-    else:
-        note = f"店取 {pickup_date} {pickup_time} | {receiver_name} | {phone}"
-
-    order = OrderDraft(
-        user_id=user_id,
-        display_name=display_name,
-        order_id=oid,
-        pickup_method=pm,
-        pickup_date=pickup_date,
-        pickup_time=pickup_time,
-        phone=phone,
-        receiver_name=receiver_name,
-        address=address,
-        items=cart,
-        shipping_fee=shipping_fee,
-        note=note,
-    )
-
-    try:
-        write_order_to_sheets(order)
-    except Exception as e:
-        print("[Order] write failed:", repr(e))
-        await line_reply(reply_token, [_text_message("系統忙碌中，訂單建立失敗，請稍後再試。")])
-        return
-
-    try:
-        create_calendar_event_for_order(order)
-    except Exception as e:
-        print("[GCAL] finalize create failed:", repr(e))
-
-    receipt_msgs = [
-        flex_cart(cart, pm, pickup_date, pickup_time, shipping_fee),
-        _text_message(f"✅ 訂單已建立（待轉帳）\n訂單編號：{oid}\n匯款後請回覆：訂單編號＋末五碼"),
-    ]
-    await line_reply(reply_token, receipt_msgs)
-
-    _cart_clear(user_id)
-    for k in ("awaiting", "receiver_name", "phone", "address"):
-        sess.pop(k, None)
-
 # =============================================================================
-# Webhook route
+# Webhook
 # =============================================================================
-
 @app.get("/")
 def health():
-    return {
-        "ok": True,
-        "app": "uoo-order-bot",
-        "env": APP_ENV,
-        "min_days_env": MIN_DAYS_ENV,
-        "max_days_env": MAX_DAYS_ENV,
-        "settings_loaded": bool(load_settings()),
-        "sheet_settings": SHEET_SETTINGS_NAME,
-        "sheet_items": SHEET_ITEMS_NAME,
-        "sheet_a": SHEET_A_NAME,
-        "sheet_b": SHEET_B_NAME,
-        "sheet_c": SHEET_C_NAME,
-        "sheet_c_log": SHEET_C_LOG_NAME,
-    }
-
+    return {"ok": True, "min_days": MIN_DAYS, "max_days": MAX_DAYS, "sheets": bool(GSHEET_ID)}
 
 @app.post("/callback")
 async def callback(request: Request, x_line_signature: str = Header(default="")):
@@ -1506,43 +815,34 @@ async def callback(request: Request, x_line_signature: str = Header(default=""))
     events = payload.get("events", []) or []
     for ev in events:
         try:
-            ev_id = ev.get("webhookEventId") or ""
-            if not ev_id:
-                ev_id = hashlib.sha1(json.dumps(ev, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-
+            # de-dup (LINE can resend)
+            ev_id = ev.get("webhookEventId") or hashlib.sha1(
+                json.dumps(ev, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
             if _dedup_seen(ev_id):
                 continue
 
             etype = ev.get("type")
-            src = ev.get("source", {}) or {}
-            user_id = src.get("userId", "")
+            user_id = (ev.get("source") or {}).get("userId", "")
             reply_token = ev.get("replyToken", "")
 
             if etype == "message":
-                msg = ev.get("message", {}) or {}
-                mtype = msg.get("type")
-
-                if mtype == "text":
-                    text = msg.get("text", "")
-
-                    consumed = await handle_followup_text(user_id, reply_token, text)
-                    if consumed:
-                        continue
-
-                    await handle_text(user_id, reply_token, text)
+                msg = ev.get("message") or {}
+                if msg.get("type") == "text":
+                    await handle_text(user_id, reply_token, msg.get("text",""))
                 else:
                     await line_reply(reply_token, [flex_main_menu()])
 
             elif etype == "postback":
-                pb = ev.get("postback", {}) or {}
-                data = pb.get("data", "")
-                await handle_postback(user_id, reply_token, data)
+                pb = ev.get("postback") or {}
+                await handle_postback(user_id, reply_token, pb.get("data",""))
 
             elif etype == "follow":
-                await line_reply(ev.get("replyToken", ""), [flex_main_menu()])
+                await line_reply(reply_token, [flex_main_menu()])
 
         except Exception as e:
-            print("[Webhook] event handling error:", repr(e))
+            # NEVER crash webhook
+            print("[Webhook] event error:", repr(e))
             print(traceback.format_exc())
 
     return JSONResponse({"ok": True})
