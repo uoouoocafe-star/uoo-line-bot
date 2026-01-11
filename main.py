@@ -38,6 +38,9 @@ SHEET_SETTINGS_NAME = os.getenv("SHEET_SETTINGS_NAME", "settings").strip()  # se
 ADMIN_USER_IDS = [x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()]
 
 TZ = timezone(timedelta(hours=8))  # Asia/Taipei
+GCAL_TIMEZONE = os.getenv("GCAL_TIMEZONE", "Asia/Taipei").strip()
+GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "").strip()
+ENABLE_GCAL = bool(GCAL_CALENDAR_ID)
 
 LINE_API_BASE = "https://api.line.me/v2/bot/message"
 
@@ -151,7 +154,7 @@ DACQUOISE_FLAVORS = ["原味", "蜜香紅茶", "日式抹茶", "日式焙茶", "
 TOAST_FLAVORS = ["原味", "蜜香紅茶", "日式抹茶", "日式焙茶", "法芙娜可可"]
 
 ITEMS = {
-    "dacquoise": {"label": "達克瓦茲", "unit_price": 95, "has_flavor": True,  "flavors": DACQUOISE_FLAVORS, "min_qty": 1, "step": 1},
+    "dacquoise": {"label": "達克瓦茲", "unit_price": 95, "has_flavor": True,  "flavors": DACQUOISE_FLAVORS, "min_qty": 2, "step": 1},
     "scone":     {"label": "原味司康", "unit_price": 65, "has_flavor": False, "flavors": [],               "min_qty": 1, "step": 1},
     "canele6":   {"label": "可麗露 6顆/盒", "unit_price": 490, "has_flavor": False, "flavors": [],        "min_qty": 1, "step": 1},
     "toast":     {"label": "伊思尼奶酥厚片", "unit_price": 85, "has_flavor": True, "flavors": TOAST_FLAVORS,"min_qty": 1, "step": 1},
@@ -244,8 +247,11 @@ def msg_flex(alt_text: str, contents: dict) -> dict:
 
 
 # =========================
-# Google Sheets
+# Google (Sheets + Calendar) - shared creds
 # =========================
+_GOOGLE_CACHE: Dict[str, Any] = {"sheets": None, "calendar": None, "creds": None}
+
+
 def load_service_account_info() -> Optional[dict]:
     if GOOGLE_SERVICE_ACCOUNT_B64:
         try:
@@ -263,15 +269,44 @@ def load_service_account_info() -> Optional[dict]:
     return None
 
 
-def get_sheets_service():
+def get_google_creds(scopes: List[str]):
     info = load_service_account_info()
     if not info:
         return None
+    return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+
+
+def get_sheets_service():
+    if _GOOGLE_CACHE.get("sheets"):
+        return _GOOGLE_CACHE["sheets"]
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    creds = get_google_creds(scopes)
+    if not creds:
+        return None
+    _GOOGLE_CACHE["creds"] = creds
+    _GOOGLE_CACHE["sheets"] = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return _GOOGLE_CACHE["sheets"]
 
 
+def get_calendar_service():
+    if not ENABLE_GCAL:
+        return None
+    if _GOOGLE_CACHE.get("calendar"):
+        return _GOOGLE_CACHE["calendar"]
+
+    # IMPORTANT: calendar scope is separate; keep minimal and stable
+    scopes = ["https://www.googleapis.com/auth/calendar"]
+    creds = get_google_creds(scopes)
+    if not creds:
+        return None
+
+    _GOOGLE_CACHE["calendar"] = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    return _GOOGLE_CACHE["calendar"]
+
+
+# =========================
+# Google Sheets
+# =========================
 def sheet_append(sheet_name: str, row: List[Any]) -> bool:
     if not GSHEET_ID:
         print("[WARN] GSHEET_ID missing, skip append.")
@@ -326,6 +361,110 @@ def sheet_update_a1(sheet_name: str, a1: str, values_2d: List[List[Any]]) -> boo
     except Exception as e:
         print(f"[ERROR] update range failed {sheet_name} {a1}:", e)
         return False
+
+
+# =========================
+# Google Calendar (只新增，不改你原本 UI/流程)
+# =========================
+def _parse_slot(slot: str) -> Optional[Tuple[str, str]]:
+    # "10:00-12:00"
+    if not slot or "-" not in slot:
+        return None
+    a, b = slot.split("-", 1)
+    a = a.strip()
+    b = b.strip()
+    if not re.match(r"^\d{2}:\d{2}$", a) or not re.match(r"^\d{2}:\d{2}$", b):
+        return None
+    return a, b
+
+
+def create_calendar_event(order_id: str, sess: dict, summary_lines: str, fee: int, grand: int) -> str:
+    """
+    只在「訂單成立」時建立事件。
+    - 店取：用 pickup_date + pickup_time 建一個有開始/結束的事件
+    - 宅配：用 delivery_date 建 All-day 事件（期望到貨日）
+    回傳 eventId；失敗就回傳 ""（不影響下單）
+    """
+    if not ENABLE_GCAL:
+        return ""
+
+    cal = get_calendar_service()
+    if not cal:
+        return ""
+
+    method = (sess.get("pickup_method") or "").strip()
+    title = f"UooUoo 甜點訂單 {order_id}（{method}）"
+
+    desc_parts = [
+        f"訂單編號：{order_id}",
+        "",
+        "內容：",
+        summary_lines or "（無）",
+        "",
+    ]
+
+    if method == "店取":
+        desc_parts += [
+            "店取資訊：",
+            f"日期：{sess.get('pickup_date','')}",
+            f"時段：{sess.get('pickup_time','')}",
+            f"取件人：{sess.get('pickup_name','')}",
+            f"電話：{sess.get('pickup_phone','')}",
+            f"地址：{PICKUP_ADDRESS}",
+            "",
+            f"應付：NT${grand}",
+        ]
+    else:
+        desc_parts += [
+            "宅配資訊：",
+            f"期望到貨日：{sess.get('delivery_date','')}（不保證準時）",
+            f"收件人：{sess.get('delivery_name','')}",
+            f"電話：{sess.get('delivery_phone','')}",
+            f"地址：{sess.get('delivery_address','')}",
+            "",
+            f"運費：NT${fee}",
+            f"應付：NT${grand}",
+        ]
+
+    description = "\n".join(desc_parts).strip()
+
+    event: Dict[str, Any] = {
+        "summary": title,
+        "description": description,
+    }
+
+    try:
+        if method == "店取":
+            ymd = (sess.get("pickup_date") or "").strip()
+            slot = (sess.get("pickup_time") or "").strip()
+            parsed = _parse_slot(slot)
+            if not ymd or not parsed:
+                # fallback to all-day
+                if not ymd:
+                    return ""
+                d0 = datetime.strptime(ymd, "%Y-%m-%d").date()
+                event["start"] = {"date": ymd}
+                event["end"] = {"date": (d0 + timedelta(days=1)).strftime("%Y-%m-%d")}
+            else:
+                start_hm, end_hm = parsed
+                # Build local naive datetime strings; include timezone field
+                start_dt = f"{ymd}T{start_hm}:00"
+                end_dt = f"{ymd}T{end_hm}:00"
+                event["start"] = {"dateTime": start_dt, "timeZone": GCAL_TIMEZONE}
+                event["end"] = {"dateTime": end_dt, "timeZone": GCAL_TIMEZONE}
+        else:
+            ymd = (sess.get("delivery_date") or "").strip()
+            if not ymd:
+                return ""
+            d0 = datetime.strptime(ymd, "%Y-%m-%d").date()
+            event["start"] = {"date": ymd}
+            event["end"] = {"date": (d0 + timedelta(days=1)).strftime("%Y-%m-%d")}
+
+        created = cal.events().insert(calendarId=GCAL_CALENDAR_ID, body=event).execute()
+        return (created or {}).get("id", "") or ""
+    except Exception as e:
+        print("[GCAL] create event failed:", e)
+        return ""
 
 
 # =========================
@@ -408,9 +547,9 @@ def is_closed(d: date, settings: Dict[str, Any]) -> bool:
     return False
 
 
-def fmt_md_date(dt: datetime) -> str:
-    wk = "一二三四五六日"[dt.weekday()]
-    return f"{dt.month}/{dt.day}（{wk}）"
+def fmt_md_date(dt0: datetime) -> str:
+    wk = "一二三四五六日"[dt0.weekday()]
+    return f"{dt0.month}/{dt0.day}（{wk}）"
 
 
 def build_available_date_buttons(settings: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -478,7 +617,7 @@ def is_phone_digits(s: str) -> bool:
 
 
 # =========================
-# Flex builders（純色系、統一）
+# Flex builders（純色系、統一）— 完全保留你原本樣式
 # =========================
 def flex_home_hint() -> dict:
     return {
@@ -622,11 +761,7 @@ def flex_checkout_summary(sess: dict) -> dict:
 def flex_admin_order_actions(order_id: str, method: str, current_status: str = "UNPAID") -> dict:
     """
     商家後台卡片（不噴 debug）
-    1) 已收款
-    2) 店取：已做好 / 宅配：已出貨
-    3) 今日待辦總覽
     """
-    # 防呆：已 PAID 就不顯示「已收款」
     buttons = []
 
     if current_status != "PAID":
@@ -714,7 +849,7 @@ def build_qty_quick(min_qty: int, max_qty: int, prefix: str) -> List[dict]:
 # =========================
 # Order write: A/B/C
 # =========================
-def write_order_A(user_id: str, order_id: str, sess: dict) -> bool:
+def write_order_A(user_id: str, order_id: str, sess: dict, gcal_event_id: str = "") -> bool:
     cart = sess["cart"]
     total = cart_total(cart)
 
@@ -737,12 +872,17 @@ def write_order_A(user_id: str, order_id: str, sess: dict) -> bool:
         pp = sess.get("pickup_phone") or ""
         note = f"取件人:{pn} | 電話:{pp}"
 
+    # 把 event_id 放進 raw_json（不改欄位，不會破壞你原本 A 表結構）
+    raw_payload = {"cart": cart}
+    if gcal_event_id:
+        raw_payload["gcal_event_id"] = gcal_event_id
+
     rowA = [
         now_str(),                               # A created_at
         user_id,                                 # B user_id
         "",                                      # C display_name（先留空）
         order_id,                                # D order_id
-        json.dumps({"cart": cart}, ensure_ascii=False),  # E raw_json
+        json.dumps(raw_payload, ensure_ascii=False),  # E raw_json
         pickup_method,                           # F method
         pickup_date,                             # G pickup_date
         pickup_time,                             # H pickup_time
@@ -755,26 +895,6 @@ def write_order_A(user_id: str, order_id: str, sess: dict) -> bool:
 
 
 def write_order_B(order_id: str, sess: dict) -> bool:
-    """
-    B表：你指定
-    - 沿用 K
-    - J 是 pickup_date
-    - K 是 pickup_time
-    - 不放 status
-    建議欄位（12欄）：
-    A created_at
-    B order_id
-    C item_name
-    D spec(可空)
-    E flavor(可空)
-    F qty
-    G unit_price
-    H subtotal
-    I pickup_method
-    J pickup_date
-    K pickup_time
-    L phone
-    """
     ok_all = True
     created_at = now_str()
     pickup_method = sess.get("pickup_method") or ""
@@ -790,7 +910,7 @@ def write_order_B(order_id: str, sess: dict) -> bool:
     for it in sess["cart"]:
         item_name = it["label"]
         flavor = (it.get("flavor") or "").strip()
-        spec = ""  # 你目前沒有 spec 就空著
+        spec = ""
 
         rowB = [
             created_at,
@@ -812,20 +932,7 @@ def write_order_B(order_id: str, sess: dict) -> bool:
     return ok_all
 
 
-def write_order_C_order(order_id: str, sess: dict) -> bool:
-    """
-    C表 = c_log：ORDER 事件（下單時 1 筆）
-    欄位（你現在畫面就是這樣）：
-    A created_at
-    B order_id
-    C flow_type (ORDER/STATUS)
-    D method
-    E amount
-    F shipping_fee
-    G grand_total
-    H status
-    I note
-    """
+def write_order_C_order(order_id: str, sess: dict, gcal_event_id: str = "") -> bool:
     created_at = now_str()
     method = sess.get("pickup_method") or ""
     amount = cart_total(sess["cart"])
@@ -837,6 +944,9 @@ def write_order_C_order(order_id: str, sess: dict) -> bool:
     else:
         note = f"宅配 期望到貨:{sess.get('delivery_date','')} | {sess.get('delivery_name','')} | {sess.get('delivery_phone','')} | {sess.get('delivery_address','')}"
 
+    if gcal_event_id:
+        note = f"{note} | gcal_event_id:{gcal_event_id}"
+
     row = [created_at, order_id, "ORDER", method, amount, fee, grand, "ORDER", note]
     return sheet_append(SHEET_C_NAME, row)
 
@@ -847,7 +957,6 @@ def append_C_status(order_id: str, status: str, note: str) -> bool:
 
 
 def find_user_id_by_order_id(order_id: str) -> Optional[str]:
-    # A表：order_id 在 D；user_id 在 B
     rows = sheet_read_range(SHEET_A_NAME, "A1:L5000")
     if not rows or len(rows) < 2:
         return None
@@ -858,26 +967,19 @@ def find_user_id_by_order_id(order_id: str) -> Optional[str]:
 
 
 def get_A_row_index_by_order_id(order_id: str) -> Optional[int]:
-    """
-    回傳 A表中（1-based row index）訂單所在列
-    """
     rows = sheet_read_range(SHEET_A_NAME, "A1:D5000")
     if not rows or len(rows) < 2:
         return None
-    for i, r in enumerate(rows[1:], start=2):  # header=1，所以資料從第2列
+    for i, r in enumerate(rows[1:], start=2):
         if len(r) >= 4 and (r[3] or "").strip() == order_id:
             return i
     return None
 
 
 def get_A_status_by_order_id(order_id: str) -> Optional[str]:
-    """
-    讀取 A表 K 欄（status）
-    """
     row_idx = get_A_row_index_by_order_id(order_id)
     if not row_idx:
         return None
-    # K 欄 => 第 11 欄
     rows = sheet_read_range(SHEET_A_NAME, f"K{row_idx}:K{row_idx}")
     if rows and rows[0]:
         return (rows[0][0] or "").strip()
@@ -885,9 +987,6 @@ def get_A_status_by_order_id(order_id: str) -> Optional[str]:
 
 
 def update_A_table_status(order_id: str, new_status: str) -> bool:
-    """
-    A表：更新 K 欄 status（最新狀態）
-    """
     row_idx = get_A_row_index_by_order_id(order_id)
     if not row_idx:
         return False
@@ -895,7 +994,7 @@ def update_A_table_status(order_id: str, new_status: str) -> bool:
 
 
 # =========================
-# 統一狀態入口（你要的「不噴 debug」核心）
+# 統一狀態入口（不噴 debug）
 # =========================
 def update_order_status(
     reply_token: str,
@@ -905,7 +1004,6 @@ def update_order_status(
     admin_message: str,
     customer_message: Optional[str] = None,
 ):
-    # 防呆：同狀態不要重複按（尤其 PAID）
     current = get_A_status_by_order_id(order_id) or ""
     if current.strip().upper() == new_status.strip().upper():
         line_reply(reply_token, [msg_text("這筆訂單已經更新過囉～不用重複按 ✅")])
@@ -914,13 +1012,11 @@ def update_order_status(
     okA = update_A_table_status(order_id, new_status)
     okC = append_C_status(order_id, new_status, admin_message)
 
-    # 商家回覆（短句可愛，不顯示工程字）
     if okA and okC:
         line_reply(reply_token, [msg_text(admin_message)])
     else:
         line_reply(reply_token, [msg_text("我有幫你按，但表單寫入好像沒成功，麻煩你看一下 Google Sheet 欄位/權限。")])
 
-    # 通知客人（可選）
     if customer_message:
         target_user = find_user_id_by_order_id(order_id)
         if target_user:
@@ -931,22 +1027,18 @@ def update_order_status(
 # 今日待辦總覽（商家用）
 # =========================
 def build_today_summary_text() -> str:
-    """
-    以 A表 status 為準（看板），避免 C log 太長
-    """
-    rows = sheet_read_range(SHEET_A_NAME, "A1:K5000")  # K=status
+    rows = sheet_read_range(SHEET_A_NAME, "A1:K5000")
     if not rows or len(rows) < 2:
         return "今天還沒有訂單～"
 
     today = datetime.now(TZ).strftime("%Y-%m-%d")
-    # A created_at 在 A欄
     unp, paid, ready, shipped = 0, 0, 0, 0
 
     for r in rows[1:]:
         if len(r) < 11:
             continue
         created_at = (r[0] or "").strip()
-        status = (r[10] or "").strip().upper()  # K
+        status = (r[10] or "").strip().upper()
         if not created_at.startswith(today):
             continue
         if status == "UNPAID":
@@ -1020,7 +1112,6 @@ def handle_event(ev: dict):
 
     sess = get_session(user_id)
 
-    # ---- message text ----
     if etype == "message" and (ev.get("message") or {}).get("type") == "text":
         text = (ev["message"].get("text") or "").strip()
 
@@ -1057,7 +1148,6 @@ def handle_event(ev: dict):
         handle_state_text(user_id, reply_token, text)
         return
 
-    # ---- postback ----
     if etype == "postback":
         data = (ev.get("postback") or {}).get("data", "")
         handle_postback(user_id, reply_token, data)
@@ -1090,10 +1180,6 @@ def reset_session(sess: dict):
 
 
 def too_fast_duplicate(sess: dict, data: str) -> bool:
-    """
-    解決「容易沒有反應」的一個根因：使用者連點/LINE 重送
-    同一秒同一 data 我們直接忽略，避免流程亂掉
-    """
     now_ts = datetime.now(TZ).timestamp()
     if sess.get("last_postback_data") == data and (now_ts - float(sess.get("last_postback_ts", 0.0))) < 1.0:
         return True
@@ -1109,7 +1195,6 @@ def handle_postback(user_id: str, reply_token: str, data: str):
     sess = get_session(user_id)
 
     if too_fast_duplicate(sess, data):
-        # 靜默忽略（避免多回）
         return
 
     # ---- 管理員功能 ----
@@ -1125,7 +1210,6 @@ def handle_postback(user_id: str, reply_token: str, data: str):
 
         act = parts[1].strip()
 
-        # 今日待辦
         if act == "SUMMARY":
             line_reply(reply_token, [msg_text(build_today_summary_text())])
             return
@@ -1298,7 +1382,6 @@ def handle_postback(user_id: str, reply_token: str, data: str):
             d_obj = datetime.strptime(ymd, "%Y-%m-%d").date()
             if is_closed(d_obj, settings):
                 line_reply(reply_token, [msg_text("這天是公休/不出貨日～請重新選擇。")])
-                # 重新丟回取貨方式
                 line_reply(reply_token, [msg_flex("取貨方式", flex_pickup_method())])
                 return
         except:
@@ -1413,7 +1496,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
                 return
             sess["state"] = "WAIT_EDIT_FLAVOR"
             sess["pending_item"] = item_key
-            sess["pending_flavor"] = idx  # 借放 idx
+            sess["pending_flavor"] = idx
             q = [quick_postback(f, f"PB:SETFLAVOR:{f}", display_text=f) for f in ITEMS[item_key]["flavors"]]
             line_reply(reply_token, [msg_text("請選新口味：", quick_items=q)])
             return
@@ -1509,14 +1592,22 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         # 建單
         order_id = gen_order_id()
 
-        okA = write_order_A(user_id, order_id, sess)
-        okB = write_order_B(order_id, sess)
-        okC = write_order_C_order(order_id, sess)
-
         total = cart_total(sess["cart"])
         fee = shipping_fee(total) if sess["pickup_method"] == "宅配" else 0
         grand = total + fee
         summary_lines = "\n".join([f"• {find_cart_line_label(x)}" for x in sess["cart"]])
+
+        # ✅ 只加這段：建立 Google Calendar 事件（失敗不影響下單）
+        gcal_event_id = ""
+        try:
+            gcal_event_id = create_calendar_event(order_id, sess, summary_lines, fee, grand)
+        except Exception as e:
+            print("[GCAL] unexpected error:", e)
+            gcal_event_id = ""
+
+        okA = write_order_A(user_id, order_id, sess, gcal_event_id=gcal_event_id)
+        okB = write_order_B(order_id, sess)
+        okC = write_order_C_order(order_id, sess, gcal_event_id=gcal_event_id)
 
         if sess["pickup_method"] == "店取":
             customer_msg = (
@@ -1548,17 +1639,14 @@ def handle_postback(user_id: str, reply_token: str, data: str):
                 + BANK_TRANSFER_TEXT
             )
 
-        # 回覆客人
         line_reply(reply_token, [msg_text(customer_msg)])
 
-        # 新訂單通知（只給管理員）
         if ADMIN_USER_IDS:
             method = sess["pickup_method"]
             admin_card = msg_flex("新訂單提醒", flex_admin_order_actions(order_id, method, current_status="UNPAID"))
             for admin_uid in ADMIN_USER_IDS:
                 line_push(admin_uid, [admin_card])
 
-        # 如果寫入失敗也不要噴 debug 給客人（只提醒商家去看）
         if not (okA and okB and okC) and ADMIN_USER_IDS and user_id in ADMIN_USER_IDS:
             line_reply(reply_token, [msg_text("提醒：表單寫入可能有問題，請檢查 Sheet 名稱/權限/欄位。")])
 
