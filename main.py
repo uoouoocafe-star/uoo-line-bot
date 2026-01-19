@@ -48,17 +48,35 @@ def get_google():
 # LINE HELPERS
 # =============================
 def line_reply(token, text):
-    requests.post(
-        "https://api.line.me/v2/bot/message/reply",
+# 兼容你舊的 ENV 命名：CHANNEL_ACCESS_TOKEN / CHANNEL_SECRET
+LINE_TOKEN = (os.getenv("CHANNEL_ACCESS_TOKEN") or os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
+LINE_SECRET = (os.getenv("CHANNEL_SECRET") or os.getenv("LINE_CHANNEL_SECRET") or "").strip()
+
+def line_reply(reply_token: str, text: str):
+    if not LINE_TOKEN:
+        print("[LINE] LINE_TOKEN is empty -> check env var name/value")
+        return
+
+    url = "https://api.line.me/v2/bot/message/reply"
+    payload = {
+        "replyToken": reply_token,
+        "messages": [{"type": "text", "text": text}]
+    }
+    r = requests.post(
+        url,
         headers={
             "Authorization": f"Bearer {LINE_TOKEN}",
             "Content-Type": "application/json"
         },
-        json={
-            "replyToken": token,
-            "messages": [{"type": "text", "text": text}]
-        }
+        json=payload,
+        timeout=15,
     )
+
+    # 這行很關鍵：你就會在 Render logs 看到 LINE 回覆失敗原因
+    if r.status_code >= 300:
+        print("[LINE] reply failed:", r.status_code, r.text)
+    else:
+        print("[LINE] reply ok")
 
 # =============================
 # MAIN LOGIC
