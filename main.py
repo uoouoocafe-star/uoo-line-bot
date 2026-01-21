@@ -30,8 +30,11 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 # A/B/C 表（你說 A=orders）
 SHEET_A_NAME = os.getenv("SHEET_NAME", "orders").strip()  # A表（orders）
 SHEET_B_NAME = os.getenv("SHEET_B_NAME", "order_items_readable").strip()  # B表（items明細）
-# C表：你要保留 c_log
-SHEET_C_NAME = os.getenv("SHEET_C_NAME", "c_log").strip()  # C表（log）
+
+# C表：保留 c_log，並「同時」寫入 cashflow
+SHEET_C_NAME = os.getenv("SHEET_C_NAME", "c_log").strip()  # C表（c_log）
+SHEET_CASHFLOW_NAME = os.getenv("SHEET_CASHFLOW_NAME", "cashflow").strip()  # cashflow（正式報表）
+
 SHEET_SETTINGS_NAME = os.getenv("SHEET_SETTINGS_NAME", "settings").strip()  # settings（可無）
 
 # 管理員 ID（逗號分隔）
@@ -239,7 +242,7 @@ def msg_flex(alt_text: str, contents: dict) -> dict:
     if not alt_text:
         alt_text = "訊息"
     if not contents:
-        contents = {"type": "bubble", "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "…" }]}}
+        contents = {"type": "bubble", "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "…"}]}}
     return {"type": "flex", "altText": alt_text, "contents": contents}
 
 
@@ -272,55 +275,6 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
-# --------- Enhanced sheet name resolving (fix c_log not writing) ---------
-_SHEET_TITLE_MAP_CACHE: Optional[Dict[str, str]] = None
-_SHEET_TITLE_MAP_CACHE_TS: float = 0.0
-_SHEET_TITLE_MAP_TTL_SEC = 60.0  # cache 60 sec
-
-
-def _normalize_sheet_title(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip()).lower()
-
-
-def _get_sheet_title_map(service) -> Dict[str, str]:
-    global _SHEET_TITLE_MAP_CACHE, _SHEET_TITLE_MAP_CACHE_TS
-    now_ts = datetime.now(TZ).timestamp()
-    if _SHEET_TITLE_MAP_CACHE and (now_ts - _SHEET_TITLE_MAP_CACHE_TS) < _SHEET_TITLE_MAP_TTL_SEC:
-        return _SHEET_TITLE_MAP_CACHE
-
-    if not GSHEET_ID:
-        return {}
-
-    try:
-        meta = service.spreadsheets().get(spreadsheetId=GSHEET_ID).execute()
-        sheets = meta.get("sheets", []) or []
-        mp: Dict[str, str] = {}
-        for sh in sheets:
-            title = ((sh.get("properties") or {}).get("title") or "").strip()
-            if not title:
-                continue
-            mp[_normalize_sheet_title(title)] = title
-        _SHEET_TITLE_MAP_CACHE = mp
-        _SHEET_TITLE_MAP_CACHE_TS = now_ts
-        return mp
-    except Exception as e:
-        print("[WARN] get spreadsheet meta failed:", e)
-        return {}
-
-
-def resolve_sheet_name(service, preferred_name: str, fallbacks: Optional[List[str]] = None) -> Optional[str]:
-    mp = _get_sheet_title_map(service)
-    if not mp:
-        return preferred_name.strip() if preferred_name else None
-
-    candidates = [preferred_name] + (fallbacks or [])
-    for name in candidates:
-        key = _normalize_sheet_title(name)
-        if key in mp:
-            return mp[key]
-    return None
-
-
 def sheet_append(sheet_name: str, row: List[Any]) -> bool:
     if not GSHEET_ID:
         print("[WARN] GSHEET_ID missing, skip append.")
@@ -329,18 +283,8 @@ def sheet_append(sheet_name: str, row: List[Any]) -> bool:
     if not service:
         print("[WARN] Google Sheet env missing, skip append.")
         return False
-
-    fallbacks = None
-    if _normalize_sheet_title(sheet_name) in ["c_log", "clog", "c log"]:
-        fallbacks = ["C_log", "c log", "C log", "C Log", "clog", "CLOG"]
-
-    actual = resolve_sheet_name(service, sheet_name, fallbacks=fallbacks)
-    if not actual:
-        print(f"[ERROR] sheet not found: {sheet_name} (fallback tried)")
-        return False
-
     try:
-        range_ = f"'{actual}'!A1"
+        range_ = f"'{sheet_name}'!A1"
         body = {"values": [row]}
         service.spreadsheets().values().append(
             spreadsheetId=GSHEET_ID,
@@ -351,7 +295,7 @@ def sheet_append(sheet_name: str, row: List[Any]) -> bool:
         ).execute()
         return True
     except Exception as e:
-        print(f"[ERROR] append to {actual} failed:", e)
+        print(f"[ERROR] append to {sheet_name} failed:", e)
         return False
 
 
@@ -359,24 +303,14 @@ def sheet_read_range(sheet_name: str, a1: str) -> List[List[str]]:
     service = get_sheets_service()
     if not service or not GSHEET_ID:
         return []
-
-    fallbacks = None
-    if _normalize_sheet_title(sheet_name) in ["c_log", "clog", "c log"]:
-        fallbacks = ["C_log", "c log", "C log", "C Log", "clog", "CLOG"]
-
-    actual = resolve_sheet_name(service, sheet_name, fallbacks=fallbacks)
-    if not actual:
-        print(f"[WARN] sheet not found: {sheet_name}")
-        return []
-
     try:
         r = service.spreadsheets().values().get(
             spreadsheetId=GSHEET_ID,
-            range=f"'{actual}'!{a1}"
+            range=f"'{sheet_name}'!{a1}"
         ).execute()
         return r.get("values", []) or []
     except Exception as e:
-        print(f"[WARN] read range failed {actual} {a1}:", e)
+        print(f"[WARN] read range failed {sheet_name} {a1}:", e)
         return []
 
 
@@ -384,26 +318,16 @@ def sheet_update_a1(sheet_name: str, a1: str, values_2d: List[List[Any]]) -> boo
     service = get_sheets_service()
     if not service or not GSHEET_ID:
         return False
-
-    fallbacks = None
-    if _normalize_sheet_title(sheet_name) in ["c_log", "clog", "c log"]:
-        fallbacks = ["C_log", "c log", "C log", "C Log", "clog", "CLOG"]
-
-    actual = resolve_sheet_name(service, sheet_name, fallbacks=fallbacks)
-    if not actual:
-        print(f"[ERROR] sheet not found: {sheet_name}")
-        return False
-
     try:
         service.spreadsheets().values().update(
             spreadsheetId=GSHEET_ID,
-            range=f"'{actual}'!{a1}",
+            range=f"'{sheet_name}'!{a1}",
             valueInputOption="RAW",
             body={"values": values_2d},
         ).execute()
         return True
     except Exception as e:
-        print(f"[ERROR] update range failed {actual} {a1}:", e)
+        print(f"[ERROR] update range failed {sheet_name} {a1}:", e)
         return False
 
 
@@ -661,7 +585,7 @@ def flex_checkout_summary(sess: dict) -> dict:
         grand = total + fee
         date_show = sess.get("delivery_date") or "（未選）"
         time_show = "—"
-        bottom_text = f"小計：NT${total}\n運費：NT${fee}\n應付：NT${grand}"
+        bottom_text = f"（不保證準時）\n小計：NT${total}\n運費：NT${fee}\n應付：NT${grand}"
     elif method == "店取":
         date_show = sess.get("pickup_date") or "（未選）"
         time_show = sess.get("pickup_time") or "（未選）"
@@ -835,7 +759,6 @@ def write_order_A(user_id: str, order_id: str, sess: dict) -> bool:
 def write_order_B(order_id: str, sess: dict) -> bool:
     """
     B表：你指定
-    - 沿用 K
     - J 是 pickup_date
     - K 是 pickup_time
     - 不放 status
@@ -890,9 +813,18 @@ def write_order_B(order_id: str, sess: dict) -> bool:
     return ok_all
 
 
+def _append_cashflow_and_clog(row: List[Any]) -> bool:
+    """
+    你指定：cashflow + c_log 都要寫入
+    """
+    ok_cashflow = sheet_append(SHEET_CASHFLOW_NAME, row)
+    ok_clog = sheet_append(SHEET_C_NAME, row)
+    return ok_cashflow and ok_clog
+
+
 def write_order_C_order(order_id: str, sess: dict) -> bool:
     """
-    C表 = c_log：ORDER 事件（下單時 1 筆）
+    cashflow / c_log：ORDER 事件（下單時 1 筆）
     欄位：
     A created_at
     B order_id
@@ -916,12 +848,15 @@ def write_order_C_order(order_id: str, sess: dict) -> bool:
         note = f"宅配 期望到貨:{sess.get('delivery_date','')} | {sess.get('delivery_name','')} | {sess.get('delivery_phone','')} | {sess.get('delivery_address','')}"
 
     row = [created_at, order_id, "ORDER", method, amount, fee, grand, "ORDER", note]
-    return sheet_append(SHEET_C_NAME, row)
+    return _append_cashflow_and_clog(row)
 
 
 def append_C_status(order_id: str, status: str, note: str) -> bool:
+    """
+    cashflow / c_log：STATUS 事件（每次狀態更新 1 筆）
+    """
     row = [now_str(), order_id, "STATUS", "", "", "", "", status, note]
-    return sheet_append(SHEET_C_NAME, row)
+    return _append_cashflow_and_clog(row)
 
 
 def find_user_id_by_order_id(order_id: str) -> Optional[str]:
@@ -955,6 +890,7 @@ def get_A_status_by_order_id(order_id: str) -> Optional[str]:
     row_idx = get_A_row_index_by_order_id(order_id)
     if not row_idx:
         return None
+    # K 欄 => 第 11 欄
     rows = sheet_read_range(SHEET_A_NAME, f"K{row_idx}:K{row_idx}")
     if rows and rows[0]:
         return (rows[0][0] or "").strip()
@@ -982,6 +918,7 @@ def update_order_status(
     admin_message: str,
     customer_message: Optional[str] = None,
 ):
+    # 防呆：同狀態不要重複按（尤其 PAID）
     current = get_A_status_by_order_id(order_id) or ""
     if current.strip().upper() == new_status.strip().upper():
         line_reply(reply_token, [msg_text("這筆訂單已經更新過囉～不用重複按 ✅")])
@@ -990,11 +927,13 @@ def update_order_status(
     okA = update_A_table_status(order_id, new_status)
     okC = append_C_status(order_id, new_status, admin_message)
 
+    # 商家回覆（短句可愛，不顯示工程字）
     if okA and okC:
         line_reply(reply_token, [msg_text(admin_message)])
     else:
         line_reply(reply_token, [msg_text("我有幫你按，但表單寫入好像沒成功，麻煩你看一下 Google Sheet 欄位/權限。")])
 
+    # 通知客人（可選）
     if customer_message:
         target_user = find_user_id_by_order_id(order_id)
         if target_user:
@@ -1005,7 +944,10 @@ def update_order_status(
 # 今日待辦總覽（商家用）
 # =========================
 def build_today_summary_text() -> str:
-    rows = sheet_read_range(SHEET_A_NAME, "A1:K5000")
+    """
+    以 A表 status 為準（看板），避免 C log 太長
+    """
+    rows = sheet_read_range(SHEET_A_NAME, "A1:K5000")  # K=status
     if not rows or len(rows) < 2:
         return "今天還沒有訂單～"
 
@@ -1016,7 +958,7 @@ def build_today_summary_text() -> str:
         if len(r) < 11:
             continue
         created_at = (r[0] or "").strip()
-        status = (r[10] or "").strip().upper()
+        status = (r[10] or "").strip().upper()  # K
         if not created_at.startswith(today):
             continue
         if status == "UNPAID":
@@ -1090,6 +1032,7 @@ def handle_event(ev: dict):
 
     sess = get_session(user_id)
 
+    # ---- message text ----
     if etype == "message" and (ev.get("message") or {}).get("type") == "text":
         text = (ev["message"].get("text") or "").strip()
 
@@ -1126,6 +1069,7 @@ def handle_event(ev: dict):
         handle_state_text(user_id, reply_token, text)
         return
 
+    # ---- postback ----
     if etype == "postback":
         data = (ev.get("postback") or {}).get("data", "")
         handle_postback(user_id, reply_token, data)
@@ -1192,6 +1136,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
 
         act = parts[1].strip()
 
+        # 今日待辦
         if act == "SUMMARY":
             line_reply(reply_token, [msg_text(build_today_summary_text())])
             return
@@ -1238,11 +1183,13 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_text("我看不懂這個按鈕耶～")])
         return
 
+    # RESET
     if data == "PB:RESET":
         reset_session(sess)
         line_reply(reply_token, [msg_text("已清空～\n請點「我要下單」開始，或點「甜點」先看菜單。")])
         return
 
+    # CONTINUE
     if data == "PB:CONTINUE":
         if not sess["ordering"]:
             line_reply(reply_token, [msg_text("請先點「我要下單」開始下單流程～")])
@@ -1250,6 +1197,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_flex("甜點菜單", flex_product_menu(ordering=True))])
         return
 
+    # CHECKOUT entry
     if data == "PB:CHECKOUT":
         if not sess["ordering"]:
             line_reply(reply_token, [msg_text("請先點「我要下單」開始下單流程～")])
@@ -1262,6 +1210,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_flex("取貨方式", flex_pickup_method())])
         return
 
+    # ITEM
     if data.startswith("PB:ITEM:"):
         if not sess["ordering"]:
             line_reply(reply_token, [msg_text("想下單請先點「我要下單」～\n你也可以點「甜點」先看菜單。")])
@@ -1287,6 +1236,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
             line_reply(reply_token, [msg_text(f"你選了：{meta['label']}\n請選數量：", quick_items=q)])
             return
 
+    # FLAVOR
     if data.startswith("PB:FLAVOR:"):
         flavor = data.split("PB:FLAVOR:", 1)[1].strip()
         item_key = sess.get("pending_item")
@@ -1303,6 +1253,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_text(f"口味：{flavor}\n請選數量：", quick_items=q)])
         return
 
+    # QTY
     if data.startswith("PB:QTY:"):
         qty = int(data.split("PB:QTY:", 1)[1].strip())
         item_key = sess.get("pending_item")
@@ -1328,6 +1279,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         ])
         return
 
+    # PICKUP METHOD
     if data.startswith("PB:PICKUP:"):
         method = data.split("PB:PICKUP:", 1)[1].strip()
         sess["pickup_method"] = method
@@ -1349,6 +1301,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
             line_reply(reply_token, [msg_text("請選「期望到貨日」（3～14天內；僅期望日；已排除公休）：", quick_items=quick_items)])
             return
 
+    # DATE
     if data.startswith("PB:DATE:"):
         ymd = data.split("PB:DATE:", 1)[1].strip()
         settings = load_settings()
@@ -1377,6 +1330,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_text("我有收到日期，但目前不是選日期的步驟喔～\n請點「前往結帳」再操作一次。")])
         return
 
+    # TIME
     if data.startswith("PB:TIME:") and sess["state"] == "WAIT_PICKUP_TIME":
         t = data.split("PB:TIME:", 1)[1].strip()
         sess["pickup_time"] = t
@@ -1386,6 +1340,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         )])
         return
 
+    # PHONE CONFIRM
     if data.startswith("PB:PHONE_OK:"):
         kind = data.split("PB:PHONE_OK:", 1)[1].strip()
         if kind == "PICKUP":
@@ -1414,6 +1369,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
             line_reply(reply_token, [msg_text("請重新輸入宅配電話（純數字）：")])
             return
 
+    # EDIT MENU
     if data == "PB:EDIT:MENU":
         if not sess["cart"]:
             line_reply(reply_token, [msg_text("購物車是空的～沒有東西可以改。")])
@@ -1500,6 +1456,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         line_reply(reply_token, [msg_text("✅ 口味已更新"), msg_flex("結帳內容", flex_checkout_summary(sess))])
         return
 
+    # NEXT
     if data == "PB:NEXT":
         if not sess["cart"]:
             line_reply(reply_token, [msg_text("購物車是空的～先選商品喔")])
@@ -1559,16 +1516,12 @@ def handle_postback(user_id: str, reply_token: str, data: str):
                 line_reply(reply_token, [msg_text("請輸入宅配地址（完整地址）：")])
                 return
 
+        # 建單
         order_id = gen_order_id()
 
         okA = write_order_A(user_id, order_id, sess)
         okB = write_order_B(order_id, sess)
         okC = write_order_C_order(order_id, sess)
-
-        # 若 C 表寫入失敗，通知管理員（避免你以為有寫其實沒寫）
-        if ADMIN_USER_IDS and not okC:
-            for admin_uid in ADMIN_USER_IDS:
-                line_push(admin_uid, [msg_text(f"⚠️ 警告：C表（{SHEET_C_NAME}）寫入失敗\n訂單：{order_id}\n請檢查分頁名稱/權限。")])
 
         total = cart_total(sess["cart"])
         fee = shipping_fee(total) if sess["pickup_method"] == "宅配" else 0
@@ -1605,20 +1558,24 @@ def handle_postback(user_id: str, reply_token: str, data: str):
                 + BANK_TRANSFER_TEXT
             )
 
+        # 回覆客人
         line_reply(reply_token, [msg_text(customer_msg)])
 
+        # 新訂單通知（只給管理員）
         if ADMIN_USER_IDS:
             method = sess["pickup_method"]
             admin_card = msg_flex("新訂單提醒", flex_admin_order_actions(order_id, method, current_status="UNPAID"))
             for admin_uid in ADMIN_USER_IDS:
                 line_push(admin_uid, [admin_card])
 
+        # 如果寫入失敗也不要噴 debug 給客人（只提醒商家去看）
         if not (okA and okB and okC) and ADMIN_USER_IDS and user_id in ADMIN_USER_IDS:
             line_reply(reply_token, [msg_text("提醒：表單寫入可能有問題，請檢查 Sheet 名稱/權限/欄位。")])
 
         reset_session(sess)
         return
 
+    # fallback
     line_reply(reply_token, [msg_text("我有收到你的操作～但流程沒對上。\n要下單請點「我要下單」。")])
 
 
