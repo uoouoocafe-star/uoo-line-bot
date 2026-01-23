@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone, date
 from typing import Dict, Any, Optional, List, Tuple
 
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import PlainTextResponse
 
 from google.oauth2 import service_account
@@ -989,7 +989,10 @@ def verify_line_signature(body: bytes, signature: str) -> bool:
 @app.get("/")
 def root():
     return {"ok": True, "service": "uoo-line-bot"}
-
+@app.head("/")
+def head_root():
+    # 給 UptimeRobot / Render 健康檢查用，避免 405
+    return Response(status_code=200)
 
 @app.post("/callback")
 async def callback(request: Request):
