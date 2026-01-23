@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone, date
 from typing import Dict, Any, Optional, List, Tuple
 
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 
 from google.oauth2 import service_account
@@ -31,9 +31,10 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 SHEET_A_NAME = os.getenv("SHEET_NAME", "orders").strip()  # A表（orders）
 SHEET_B_NAME = os.getenv("SHEET_B_NAME", "order_items_readable").strip()  # B表（items明細）
 
-# C表：保留 c_log，並「同時」寫入 cashflow
-SHEET_C_NAME = os.getenv("SHEET_C_NAME", "c_log").strip()  # C表（c_log）
-SHEET_CASHFLOW_NAME = os.getenv("SHEET_CASHFLOW_NAME", "cashflow").strip()  # cashflow（正式報表）
+# C表：你要保留 c_log
+SHEET_C_NAME = os.getenv("SHEET_C_NAME", "c_log").strip()  # C表（log）
+# ✅ 新增：cashflow 表（跟 c_log 同格式）
+SHEET_CASHFLOW_NAME = os.getenv("SHEET_CASHFLOW_NAME", "cashflow").strip()
 
 SHEET_SETTINGS_NAME = os.getenv("SHEET_SETTINGS_NAME", "settings").strip()  # settings（可無）
 
@@ -108,6 +109,11 @@ PICKUP_SLOTS = ["10:00-12:00", "12:00-14:00", "14:00-16:00"]
 # App
 # =========================
 app = FastAPI()
+
+# ✅ 給 UptimeRobot 免費版 HEAD 用：永遠回 200
+@app.head("/")
+def head_root():
+    return Response(status_code=200)
 
 # =========================
 # In-memory session store
@@ -192,7 +198,7 @@ def line_reply(reply_token: str, messages: List[dict]):
         f"{LINE_API_BASE}/reply",
         headers=line_headers(),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        timeout=15,
+        timeout=12,
     )
     if r.status_code >= 300:
         print("[ERROR] reply failed:", r.status_code, r.text)
@@ -218,7 +224,7 @@ def line_push(user_id: str, messages: List[dict]):
         f"{LINE_API_BASE}/push",
         headers=line_headers(),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        timeout=15,
+        timeout=12,
     )
     if r.status_code >= 300:
         print("[ERROR] push failed:", r.status_code, r.text)
@@ -242,7 +248,7 @@ def msg_flex(alt_text: str, contents: dict) -> dict:
     if not alt_text:
         alt_text = "訊息"
     if not contents:
-        contents = {"type": "bubble", "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "…"}]}}
+        contents = {"type": "bubble", "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "…" }]}}
     return {"type": "flex", "altText": alt_text, "contents": contents}
 
 
@@ -585,7 +591,7 @@ def flex_checkout_summary(sess: dict) -> dict:
         grand = total + fee
         date_show = sess.get("delivery_date") or "（未選）"
         time_show = "—"
-        bottom_text = f"（不保證準時）\n小計：NT${total}\n運費：NT${fee}\n應付：NT${grand}"
+        bottom_text = f"小計：NT${total}\n運費：NT${fee}\n應付：NT${grand}"
     elif method == "店取":
         date_show = sess.get("pickup_date") or "（未選）"
         time_show = sess.get("pickup_time") or "（未選）"
@@ -757,25 +763,6 @@ def write_order_A(user_id: str, order_id: str, sess: dict) -> bool:
 
 
 def write_order_B(order_id: str, sess: dict) -> bool:
-    """
-    B表：你指定
-    - J 是 pickup_date
-    - K 是 pickup_time
-    - 不放 status
-    建議欄位（12欄）：
-    A created_at
-    B order_id
-    C item_name
-    D spec(可空)
-    E flavor(可空)
-    F qty
-    G unit_price
-    H subtotal
-    I pickup_method
-    J pickup_date
-    K pickup_time
-    L phone
-    """
     ok_all = True
     created_at = now_str()
     pickup_method = sess.get("pickup_method") or ""
@@ -791,7 +778,7 @@ def write_order_B(order_id: str, sess: dict) -> bool:
     for it in sess["cart"]:
         item_name = it["label"]
         flavor = (it.get("flavor") or "").strip()
-        spec = ""  # 你目前沒有 spec 就空著
+        spec = ""
 
         rowB = [
             created_at,
@@ -813,29 +800,13 @@ def write_order_B(order_id: str, sess: dict) -> bool:
     return ok_all
 
 
-def _append_cashflow_and_clog(row: List[Any]) -> bool:
-    """
-    你指定：cashflow + c_log 都要寫入
-    """
-    ok_cashflow = sheet_append(SHEET_CASHFLOW_NAME, row)
-    ok_clog = sheet_append(SHEET_C_NAME, row)
-    return ok_cashflow and ok_clog
+def _append_log_to_both(row: List[Any]) -> Tuple[bool, bool]:
+    ok1 = sheet_append(SHEET_C_NAME, row)
+    ok2 = sheet_append(SHEET_CASHFLOW_NAME, row)
+    return ok1, ok2
 
 
 def write_order_C_order(order_id: str, sess: dict) -> bool:
-    """
-    cashflow / c_log：ORDER 事件（下單時 1 筆）
-    欄位：
-    A created_at
-    B order_id
-    C flow_type (ORDER/STATUS)
-    D method
-    E amount
-    F shipping_fee
-    G grand_total
-    H status
-    I note
-    """
     created_at = now_str()
     method = sess.get("pickup_method") or ""
     amount = cart_total(sess["cart"])
@@ -847,20 +818,19 @@ def write_order_C_order(order_id: str, sess: dict) -> bool:
     else:
         note = f"宅配 期望到貨:{sess.get('delivery_date','')} | {sess.get('delivery_name','')} | {sess.get('delivery_phone','')} | {sess.get('delivery_address','')}"
 
+    # ✅ c_log + cashflow 同格式雙寫
     row = [created_at, order_id, "ORDER", method, amount, fee, grand, "ORDER", note]
-    return _append_cashflow_and_clog(row)
+    ok1, ok2 = _append_log_to_both(row)
+    return bool(ok1 and ok2)
 
 
 def append_C_status(order_id: str, status: str, note: str) -> bool:
-    """
-    cashflow / c_log：STATUS 事件（每次狀態更新 1 筆）
-    """
     row = [now_str(), order_id, "STATUS", "", "", "", "", status, note]
-    return _append_cashflow_and_clog(row)
+    ok1, ok2 = _append_log_to_both(row)
+    return bool(ok1 and ok2)
 
 
 def find_user_id_by_order_id(order_id: str) -> Optional[str]:
-    # A表：order_id 在 D；user_id 在 B
     rows = sheet_read_range(SHEET_A_NAME, "A1:L5000")
     if not rows or len(rows) < 2:
         return None
@@ -871,26 +841,19 @@ def find_user_id_by_order_id(order_id: str) -> Optional[str]:
 
 
 def get_A_row_index_by_order_id(order_id: str) -> Optional[int]:
-    """
-    回傳 A表中（1-based row index）訂單所在列
-    """
     rows = sheet_read_range(SHEET_A_NAME, "A1:D5000")
     if not rows or len(rows) < 2:
         return None
-    for i, r in enumerate(rows[1:], start=2):  # header=1，所以資料從第2列
+    for i, r in enumerate(rows[1:], start=2):
         if len(r) >= 4 and (r[3] or "").strip() == order_id:
             return i
     return None
 
 
 def get_A_status_by_order_id(order_id: str) -> Optional[str]:
-    """
-    讀取 A表 K 欄（status）
-    """
     row_idx = get_A_row_index_by_order_id(order_id)
     if not row_idx:
         return None
-    # K 欄 => 第 11 欄
     rows = sheet_read_range(SHEET_A_NAME, f"K{row_idx}:K{row_idx}")
     if rows and rows[0]:
         return (rows[0][0] or "").strip()
@@ -898,9 +861,6 @@ def get_A_status_by_order_id(order_id: str) -> Optional[str]:
 
 
 def update_A_table_status(order_id: str, new_status: str) -> bool:
-    """
-    A表：更新 K 欄 status（最新狀態）
-    """
     row_idx = get_A_row_index_by_order_id(order_id)
     if not row_idx:
         return False
@@ -908,7 +868,7 @@ def update_A_table_status(order_id: str, new_status: str) -> bool:
 
 
 # =========================
-# 統一狀態入口（你要的「不噴 debug」核心）
+# 統一狀態入口（不噴 debug）
 # =========================
 def update_order_status(
     reply_token: str,
@@ -918,7 +878,6 @@ def update_order_status(
     admin_message: str,
     customer_message: Optional[str] = None,
 ):
-    # 防呆：同狀態不要重複按（尤其 PAID）
     current = get_A_status_by_order_id(order_id) or ""
     if current.strip().upper() == new_status.strip().upper():
         line_reply(reply_token, [msg_text("這筆訂單已經更新過囉～不用重複按 ✅")])
@@ -927,13 +886,11 @@ def update_order_status(
     okA = update_A_table_status(order_id, new_status)
     okC = append_C_status(order_id, new_status, admin_message)
 
-    # 商家回覆（短句可愛，不顯示工程字）
     if okA and okC:
         line_reply(reply_token, [msg_text(admin_message)])
     else:
         line_reply(reply_token, [msg_text("我有幫你按，但表單寫入好像沒成功，麻煩你看一下 Google Sheet 欄位/權限。")])
 
-    # 通知客人（可選）
     if customer_message:
         target_user = find_user_id_by_order_id(order_id)
         if target_user:
@@ -944,10 +901,7 @@ def update_order_status(
 # 今日待辦總覽（商家用）
 # =========================
 def build_today_summary_text() -> str:
-    """
-    以 A表 status 為準（看板），避免 C log 太長
-    """
-    rows = sheet_read_range(SHEET_A_NAME, "A1:K5000")  # K=status
+    rows = sheet_read_range(SHEET_A_NAME, "A1:K5000")
     if not rows or len(rows) < 2:
         return "今天還沒有訂單～"
 
@@ -958,7 +912,7 @@ def build_today_summary_text() -> str:
         if len(r) < 11:
             continue
         created_at = (r[0] or "").strip()
-        status = (r[10] or "").strip().upper()  # K
+        status = (r[10] or "").strip().upper()
         if not created_at.startswith(today):
             continue
         if status == "UNPAID":
@@ -999,8 +953,20 @@ def root():
     return {"ok": True, "service": "uoo-line-bot"}
 
 
+def _process_events(events: List[dict]):
+    for ev in events:
+        try:
+            handle_event(ev)
+        except Exception as e:
+            print("[ERROR] handle_event:", e)
+
+
 @app.post("/callback")
-async def callback(request: Request):
+async def callback(request: Request, background_tasks: BackgroundTasks):
+    """
+    ✅ 秒回 OK：先回 200 給 LINE，避免冷啟/慢寫 sheet 導致 webhook 失敗
+    事件改用背景處理。
+    """
     body = await request.body()
     signature = request.headers.get("X-Line-Signature", "")
 
@@ -1010,12 +976,8 @@ async def callback(request: Request):
     payload = json.loads(body.decode("utf-8"))
     events = payload.get("events", [])
 
-    for ev in events:
-        try:
-            handle_event(ev)
-        except Exception as e:
-            print("[ERROR] handle_event:", e)
-
+    # ✅ 背景處理事件，HTTP 立刻回 OK
+    background_tasks.add_task(_process_events, events)
     return PlainTextResponse("OK")
 
 
@@ -1102,10 +1064,6 @@ def reset_session(sess: dict):
 
 
 def too_fast_duplicate(sess: dict, data: str) -> bool:
-    """
-    解決「容易沒有反應」的一個根因：使用者連點/LINE 重送
-    同一秒同一 data 我們直接忽略，避免流程亂掉
-    """
     now_ts = datetime.now(TZ).timestamp()
     if sess.get("last_postback_data") == data and (now_ts - float(sess.get("last_postback_ts", 0.0))) < 1.0:
         return True
@@ -1136,7 +1094,6 @@ def handle_postback(user_id: str, reply_token: str, data: str):
 
         act = parts[1].strip()
 
-        # 今日待辦
         if act == "SUMMARY":
             line_reply(reply_token, [msg_text(build_today_summary_text())])
             return
@@ -1423,7 +1380,7 @@ def handle_postback(user_id: str, reply_token: str, data: str):
                 return
             sess["state"] = "WAIT_EDIT_FLAVOR"
             sess["pending_item"] = item_key
-            sess["pending_flavor"] = idx  # 借放 idx
+            sess["pending_flavor"] = idx
             q = [quick_postback(f, f"PB:SETFLAVOR:{f}", display_text=f) for f in ITEMS[item_key]["flavors"]]
             line_reply(reply_token, [msg_text("請選新口味：", quick_items=q)])
             return
@@ -1519,15 +1476,12 @@ def handle_postback(user_id: str, reply_token: str, data: str):
         # 建單
         order_id = gen_order_id()
 
-        okA = write_order_A(user_id, order_id, sess)
-        okB = write_order_B(order_id, sess)
-        okC = write_order_C_order(order_id, sess)
-
         total = cart_total(sess["cart"])
         fee = shipping_fee(total) if sess["pickup_method"] == "宅配" else 0
         grand = total + fee
         summary_lines = "\n".join([f"• {find_cart_line_label(x)}" for x in sess["cart"]])
 
+        # ✅ 先回覆客人（避免 replyToken 過期），寫表放後面
         if sess["pickup_method"] == "店取":
             customer_msg = (
                 "✅ 訂單已建立（待轉帳）\n"
@@ -1558,7 +1512,6 @@ def handle_postback(user_id: str, reply_token: str, data: str):
                 + BANK_TRANSFER_TEXT
             )
 
-        # 回覆客人
         line_reply(reply_token, [msg_text(customer_msg)])
 
         # 新訂單通知（只給管理員）
@@ -1568,9 +1521,15 @@ def handle_postback(user_id: str, reply_token: str, data: str):
             for admin_uid in ADMIN_USER_IDS:
                 line_push(admin_uid, [admin_card])
 
-        # 如果寫入失敗也不要噴 debug 給客人（只提醒商家去看）
-        if not (okA and okB and okC) and ADMIN_USER_IDS and user_id in ADMIN_USER_IDS:
-            line_reply(reply_token, [msg_text("提醒：表單寫入可能有問題，請檢查 Sheet 名稱/權限/欄位。")])
+        # ✅ 寫入 A/B/C + cashflow（寫入失敗只通知管理員，不噴給客人）
+        okA = write_order_A(user_id, order_id, sess)
+        okB = write_order_B(order_id, sess)
+        okC = write_order_C_order(order_id, sess)  # 已雙寫 c_log + cashflow
+
+        if not (okA and okB and okC) and ADMIN_USER_IDS:
+            warn = f"⚠️ 提醒：訂單 {order_id} 表單寫入可能失敗（請檢查 Sheet 名稱/權限/欄位）。"
+            for admin_uid in ADMIN_USER_IDS:
+                line_push(admin_uid, [msg_text(warn)])
 
         reset_session(sess)
         return
